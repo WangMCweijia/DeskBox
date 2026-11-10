@@ -1,0 +1,9 @@
+{
+  "dida_token": "<在滴答清单网页版 设置 -> 账户与安全 -> API 口令 生成>",
+  "dida_base_url": "https://api.dida365.com/open/v1",
+  "dida_project_id": "<用 --list-projects 查到的清单 id>",
+  "todo_json": "C:/Users/wang/AppData/Local/DeskBox/data/widgets/7c119a1e-892e-4211-8e39-966f2a80f9b7/todo.json",
+  "poll_seconds": 12,
+  "completed_lookback_days": 30,
+  "remote_delete_to_tombstone": false
+}
