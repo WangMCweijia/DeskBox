@@ -22,6 +22,7 @@ import re
 import sys
 
 VIEW_MODEL = pathlib.Path("src/DeskBox/ViewModels/TodoWidgetViewModel.cs")
+APPEARANCE_VM = pathlib.Path("src/DeskBox/ViewModels/TodoWidgetViewModel.FilteringAndAppearance.cs")
 HOT_RELOAD = pathlib.Path("src/DeskBox/ViewModels/TodoSyncHotReload.cs")
 SETTINGS_XAML = pathlib.Path("src/DeskBox/Views/SettingsWindow.xaml")
 SETTINGS_VM = pathlib.Path("src/DeskBox/ViewModels/SettingsViewModel.cs")
@@ -30,7 +31,28 @@ UPDATE_SERVICE = pathlib.Path("src/DeskBox/Services/AppUpdateService.cs")
 MARKER_CTOR = "AttachSync(_store);"
 MARKER_DISPOSE = "DetachSync();"
 MARKER_XAML = 'x:Name="DidaSyncEnabledSwitch"'
+MARKER_TODO_UI = 'x:Name="TodoColorFilterSwitch"'
 MARKER_BRANDING = "WangMCweijia"
+
+# --- Todo appearance switch (colour filter strip on/off) ------------------
+COLOR_FILTER_OLD = "    public Visibility ColorFilterVisibility => Visibility.Visible;"
+COLOR_FILTER_NEW = (
+    "    public Visibility ColorFilterVisibility => TodoUiOptions.ShowColorFilter\n"
+    "        ? Visibility.Visible\n"
+    "        : Visibility.Collapsed;"
+)
+REFRESH_ANCHOR = (
+    "    private void RefreshVisibleStateProperties()\n"
+    "    {\n"
+    "        OnPropertyChanged(nameof(HasVisibleItems));\n"
+)
+REFRESH_PATCHED = (
+    "    private void RefreshVisibleStateProperties()\n"
+    "    {\n"
+    "        EnsureColorFilterAllowedIfHidden();\n"
+    "        OnPropertyChanged(nameof(HasVisibleItems));\n"
+)
+MARKER_REFRESH = "EnsureColorFilterAllowedIfHidden();"
 
 # Rebranding: this fork keeps the app pointing at its own repository instead of
 # the upstream site. Every entry is (file, old, new) and is skipped when the
@@ -66,6 +88,19 @@ ABOUT_ME_BUTTON_RE = re.compile(
 )
 ABOUT_SITE_BUTTON_RE = re.compile(
     r'[ \t]*<Button\s+x:Name="AboutWebsiteButton"[\s\S]*?</Button>\r?\n'
+)
+
+TEST_CONTRACT = pathlib.Path("tests/DeskBox.Tests/ModuleBoundaryContractTests.cs")
+MARKER_BUDGET = '["src/DeskBox/Services/DidaSyncService.cs"]'
+MARKER_BUDGET_UI = '["src/DeskBox/Services/TodoUiOptions.cs"]'
+BUDGET_ANCHOR = '        ["src/DeskBox/Services/AotShellMoveFixture.cs"] = 1,\n'
+BUDGET_UI_LINE = '        ["src/DeskBox/Services/TodoUiOptions.cs"] = 1,\n'
+BUDGET_ENTRIES = (
+    "        // Dida365 sync writes JSON atomically (temp file + File.Move): the\n"
+    "        // hot-reload signal, the sync state, and dida-sync.json itself.\n"
+    '        ["src/DeskBox/Services/DidaSyncConfig.cs"] = 1,\n'
+    '        ["src/DeskBox/Services/DidaSyncService.cs"] = 2,\n'
+    + BUDGET_UI_LINE
 )
 
 CTOR_RE = re.compile(
@@ -118,6 +153,13 @@ DIDA_XAML = """                            <toolkit:SettingsExpander
                                     </toolkit:SettingsCard>
                                 </toolkit:SettingsExpander.Items>
                             </toolkit:SettingsExpander>
+                            <toolkit:SettingsCard
+                                HorizontalContentAlignment="Stretch"
+                                Loaded="TodoUiSection_Loaded"
+                                Description="待办格子顶部的颜色筛选条，连续 8 个色点；关掉后只显示任务列表"
+                                Header="显示颜色筛选条">
+                                <ToggleSwitch x:Name="TodoColorFilterSwitch" MinWidth="0" OffContent="" OnContent="" Toggled="TodoColorFilter_Toggled" />
+                            </toolkit:SettingsCard>
 """
 
 
@@ -286,6 +328,88 @@ def patch_branding(check: bool) -> int:
     return 0
 
 
+def patch_todo_ui(check: bool) -> int:
+    """Wire the "show colour filter strip" switch into the widget."""
+    pairs = (
+        (VIEW_MODEL, COLOR_FILTER_OLD, COLOR_FILTER_NEW, "colour filter visibility"),
+        (APPEARANCE_VM, REFRESH_ANCHOR, REFRESH_PATCHED, "colour filter fallback"),
+    )
+
+    pending: dict[pathlib.Path, tuple[str, bool, str]] = {}
+    for path, old, new, label in pairs:
+        if not path.is_file():
+            print(f"MISSING: {path}", file=sys.stderr)
+            return 2
+
+        text, has_bom, newline = read_text(path)
+        if new in text:
+            continue
+        if old not in text:
+            print(f"ERROR: {label} anchor missing in {path}", file=sys.stderr)
+            return 3
+
+        pending[path] = (text.replace(old, new, 1), has_bom, newline)
+
+    if not pending:
+        print("OK: todo appearance switch already wired.")
+        return 0
+
+    if check:
+        print("MISSING: todo appearance switch is not wired.", file=sys.stderr)
+        return 1
+
+    for path, (text, has_bom, newline) in pending.items():
+        write_text(path, text, has_bom, newline)
+        print(f"patched: todo appearance switch in {path}")
+    return 0
+
+
+def patch_test_budget(check: bool) -> int:
+    """Register the sync engine's atomic writes in the file-mutation ratchet.
+
+    ModuleBoundaryContractTests caps File.Move call sites per file; our JSON
+    writes (signal, state, config) use temp-file + move, so the budget has to
+    name them. Skipped when the test file is absent (minimal checkouts).
+    """
+    if not TEST_CONTRACT.is_file():
+        print("SKIP: boundary-contract test not present.")
+        return 0
+
+    text, has_bom, newline = read_text(TEST_CONTRACT)
+    if MARKER_BUDGET in text:
+        if MARKER_BUDGET_UI in text:
+            print("OK: sync file-mutation budget already registered.")
+            return 0
+
+        # Older injection only listed the sync files; append the UI options one.
+        line = '        ["src/DeskBox/Services/DidaSyncService.cs"] = 2,\n'
+        if line not in text:
+            print("ERROR: sync budget line not found for the UI top-up.", file=sys.stderr)
+            return 3
+
+        if check:
+            print("MISSING: TodoUiOptions is not in the mutation budget.", file=sys.stderr)
+            return 1
+
+        text = text.replace(line, line + BUDGET_UI_LINE, 1)
+        write_text(TEST_CONTRACT, text, has_bom, newline)
+        print("patched: TodoUiOptions added to the mutation budget")
+        return 0
+
+    if check:
+        print("MISSING: sync file-mutation budget is not registered.", file=sys.stderr)
+        return 1
+
+    if BUDGET_ANCHOR not in text:
+        print("ERROR: destructive-operation allowlist anchor changed upstream.", file=sys.stderr)
+        return 3
+
+    text = text.replace(BUDGET_ANCHOR, BUDGET_ANCHOR + BUDGET_ENTRIES, 1)
+    write_text(TEST_CONTRACT, text, has_bom, newline)
+    print(f"patched: sync file-mutation budget in {TEST_CONTRACT}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="verify only")
@@ -295,7 +419,14 @@ def main() -> int:
         print(f"MISSING: {HOT_RELOAD}", file=sys.stderr)
         return 2
 
-    for step in (patch_view_model, patch_settings_xaml, patch_branding, strip_about_buttons):
+    for step in (
+        patch_view_model,
+        patch_settings_xaml,
+        patch_branding,
+        strip_about_buttons,
+        patch_todo_ui,
+        patch_test_budget,
+    ):
         result = step(args.check)
         if result != 0:
             return result

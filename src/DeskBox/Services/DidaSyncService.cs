@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Linq;
 using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
 using DeskBox.Models;
@@ -326,6 +327,23 @@ internal sealed class DidaSyncService
         string primaryProject = config.PrimaryProjectId;
 
         TodoWidgetData local = await store.LoadAsync().ConfigureAwait(false);
+
+        // A different API token means a different account. Replaying the old
+        // local mirror into it would create every task again over there, so the
+        // mapping and the mirror are dropped before the first round against a
+        // new account.
+        string fingerprint = TokenFingerprint(config.Token);
+        if (state["tokenFingerprint"]?.GetValue<string>() is { Length: > 0 } previousFingerprint &&
+            !string.Equals(previousFingerprint, fingerprint, StringComparison.Ordinal))
+        {
+            byLocal.Clear();
+            local.Items = new List<TodoItem>();
+            await store.SaveAsync(local).ConfigureAwait(false);
+            App.Log("[DidaSync] API token changed: cleared local mirror and mapping for the new account.");
+        }
+
+        state["tokenFingerprint"] = fingerprint;
+
         var planned = new Dictionary<string, TodoItem>(StringComparer.Ordinal);
         foreach (TodoItem item in local.Items)
         {
@@ -749,6 +767,12 @@ internal sealed class DidaSyncService
         string temp = signalPath + ".tmp";
         await File.WriteAllTextAsync(temp, payload, token).ConfigureAwait(false);
         File.Move(temp, signalPath, overwrite: true);
+    }
+
+    private static string TokenFingerprint(string token)
+    {
+        byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(token ?? string.Empty));
+        return Convert.ToHexString(hash)[..16];
     }
 
     private static JsonObject LoadState(string path)

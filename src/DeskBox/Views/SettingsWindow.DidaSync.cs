@@ -213,11 +213,13 @@ public sealed partial class SettingsWindow
                 return;
             }
 
-            // First run (no saved multi-select scope yet): everything is ticked
-            // so the widget shows the whole account. Afterwards the saved scope
-            // wins.
-            IReadOnlyList<string> wanted = _didaConfig.ProjectIds.Count > 0
-                ? _didaConfig.SyncProjectIds
+            // Keep the saved scope when it still exists, otherwise tick
+            // everything: a different API token brings entirely different
+            // project ids, and an empty selection would look like a broken sync.
+            IReadOnlyList<string> saved = _didaConfig.SyncProjectIds;
+            bool anyKnown = saved.Count > 0 && items.Any(item => saved.Contains(item.Id));
+            IReadOnlyList<string> wanted = anyKnown
+                ? saved
                 : items.Select(item => item.Id).ToList();
 
             _didaSuppressEvents = true;
