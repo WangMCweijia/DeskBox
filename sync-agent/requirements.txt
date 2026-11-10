@@ -1,0 +1,4 @@
+# No third-party packages. Python 3.10+ standard library only.
+# Verified commands:
+#   python dida_sync.py --list-projects
+#   python dida_sync.py --once --dry-run
