@@ -33,8 +33,11 @@ jobs:
       - name: Ensure Todo sync wiring (idempotent)
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           python scripts/apply_sync_patch.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/apply_sync_patch.py --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
