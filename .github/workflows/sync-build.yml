@@ -87,6 +87,25 @@ jobs:
           -p:PublishSingleFile=false
           -v:minimal
 
+      - name: Restore retail PRI and WinAppSDK Insights resource
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # A plain Release publish emits a ~615 KB DeskBox.pri WITHOUT the merged
+          # WinUI framework resources. DeskBox then dies at startup with
+          # "Cannot locate resource from ms-appx:///Microsoft.UI.Xaml/Themes/themeresources.xaml".
+          # The retail AOT package carries a ~2.8 MB merged pri. The WinAppSDK
+          # component payload also omits Microsoft.WindowsAppRuntime.Insights.Resource.dll
+          # (upstream publish-aot-retail.ps1 restores it manually).
+          # These two files are extracted from the matching official x64 release
+          # and stored under patches/runtime; refresh them when upstream ships a
+          # new version with changed XAML resources.
+          Copy-Item -LiteralPath 'patches/runtime/DeskBox.pri' -Destination '.artifacts/publish/DeskBox.pri' -Force
+          Copy-Item -LiteralPath 'patches/runtime/Microsoft.WindowsAppRuntime.Insights.Resource.dll' -Destination '.artifacts/publish/' -Force
+          $pri = Get-Item -LiteralPath '.artifacts/publish/DeskBox.pri'
+          if ($pri.Length -lt 2000000) { throw "DeskBox.pri is not the merged retail index ($($pri.Length) bytes)." }
+          Write-Host "retail DeskBox.pri = $($pri.Length) bytes; Insights resource restored."
+
       - name: Read version and package
         shell: pwsh
         run: |
