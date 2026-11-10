@@ -1,4 +1,11 @@
-name: Build DeskBox with Todo hot reload
+name: Build DeskBox with Todo sync (Native AOT)
+
+# Produces the same retail shape as the upstream release:
+#   Native AOT single-file DeskBox.exe + DeskBox.ThumbnailProxy.exe + deskbox_native.dll
+#   + merged DeskBox.pri + WindowsAppRuntime Insights resource.
+# A plain (PublishAot=false) publish is NOT usable: it ships a 339 KB apphost without
+# the Rust natives, and the unmerged 615 KB pri makes DeskBox die on
+# "Cannot locate resource from ms-appx:///Microsoft.UI.Xaml/Themes/themeresources.xaml".
 
 on:
   push:
@@ -17,12 +24,13 @@ permissions:
 
 jobs:
   build:
-    name: Build and publish win-x64
+    name: Build and publish win-x64 (Native AOT)
     runs-on: windows-latest
+    timeout-minutes: 150
     env:
-      RestoreLockedMode: true
       DOTNET_CLI_UI_LANGUAGE: en-US
       DOTNET_NOLOGO: '1'
+      CARGO_TERM_COLOR: never
 
     steps:
       - name: Checkout fork
@@ -39,81 +47,116 @@ jobs:
           python scripts/apply_sync_patch.py --check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Setup .NET
+      - name: Setup .NET SDK
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
+          dotnet-quality: 'ga'
 
-      - name: Restore
-        shell: pwsh
-        run: dotnet restore .\DeskBox.sln --locked-mode -p:Platform=x64 -p:RuntimeIdentifier=win-x64
-
-      - name: Build
-        shell: pwsh
-        run: >-
-          dotnet build .\src\DeskBox\DeskBox.csproj
-          --configuration Release --no-restore
-          -p:Platform=x64 -p:RuntimeIdentifier=win-x64
-          -p:DeskBoxRustNative=false -p:DeskBoxShellThumbnailProxy=false
-          -v:minimal
-
-      - name: Test
-        # The upstream suite takes several minutes and does not gate packaging.
-        # Opt in explicitly from a manual run when touching ViewModel code.
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_tests == 'false' }}
-        timeout-minutes: 12
-        shell: pwsh
-        run: >-
-          dotnet test .\tests\DeskBox.Tests\DeskBox.Tests.csproj
-          --configuration Release --no-restore
-          -p:Platform=x64 -p:RuntimeIdentifier=win-x64
-          -p:DeskBoxRustNative=false -p:DeskBoxShellThumbnailProxy=false
-          -p:WindowsAppSdkBootstrapInitialize=false
-          --logger "trx;LogFileName=test-results.trx" -v:minimal
-
-      - name: Publish
-        shell: pwsh
-        run: >-
-          dotnet publish .\src\DeskBox\DeskBox.csproj
-          --configuration Release --no-restore
-          --output .artifacts\publish
-          -p:Platform=x64 -p:RuntimeIdentifier=win-x64
-          -p:DeskBoxDistribution=Direct
-          -p:PublishAot=false
-          -p:DeskBoxRustNative=false
-          -p:DeskBoxShellThumbnailProxy=false
-          -p:SelfContained=true
-          -p:WindowsAppSDKSelfContained=true
-          -p:PublishSingleFile=false
-          -v:minimal
-
-      - name: Restore retail PRI and WinAppSDK Insights resource
+      - name: Setup Rust toolchain
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # A plain Release publish emits a ~615 KB DeskBox.pri WITHOUT the merged
-          # WinUI framework resources. DeskBox then dies at startup with
-          # "Cannot locate resource from ms-appx:///Microsoft.UI.Xaml/Themes/themeresources.xaml".
-          # The retail AOT package carries a ~2.8 MB merged pri. The WinAppSDK
-          # component payload also omits Microsoft.WindowsAppRuntime.Insights.Resource.dll
-          # (upstream publish-aot-retail.ps1 restores it manually).
-          # These two files are extracted from the matching official x64 release
-          # and stored under patches/runtime; refresh them when upstream ships a
-          # new version with changed XAML resources.
-          Copy-Item -LiteralPath 'patches/runtime/DeskBox.pri' -Destination '.artifacts/publish/DeskBox.pri' -Force
-          Copy-Item -LiteralPath 'patches/runtime/Microsoft.WindowsAppRuntime.Insights.Resource.dll' -Destination '.artifacts/publish/' -Force
-          $pri = Get-Item -LiteralPath '.artifacts/publish/DeskBox.pri'
-          if ($pri.Length -lt 2000000) { throw "DeskBox.pri is not the merged retail index ($($pri.Length) bytes)." }
-          Write-Host "retail DeskBox.pri = $($pri.Length) bytes; Insights resource restored."
+          $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+          if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+            $rustupInit = Join-Path $env:RUNNER_TEMP 'rustup-init.exe'
+            Invoke-WebRequest -Uri 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe' -OutFile $rustupInit
+            & $rustupInit -y --profile minimal --default-toolchain 1.96.0 --target x86_64-pc-windows-msvc --no-modify-path
+            if ($LASTEXITCODE -ne 0) { throw "rustup-init failed with exit code $LASTEXITCODE." }
+          }
+          # rust-toolchain.toml pins 1.96.0 plus clippy/rustfmt and both MSVC targets.
+          & (Join-Path $cargoBin 'rustup.exe') toolchain install 1.96.0 --profile minimal --component clippy,rustfmt --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install failed with exit code $LASTEXITCODE." }
+          "PATH=$cargoBin;$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & (Join-Path $cargoBin 'cargo.exe') --version
+          & (Join-Path $cargoBin 'rustc.exe') --version
 
-      - name: Read version and package
+      - name: Restore
         shell: pwsh
         run: |
-          [xml]$proj = Get-Content .\src\DeskBox\DeskBox.csproj -Raw
-          $version = ($proj.Project.PropertyGroup.Version | Where-Object { $_ }) | Select-Object -First 1
-          if (-not $version) { $version = "dev" }
+          $ErrorActionPreference = 'Stop'
+          dotnet restore .\src\DeskBox\DeskBox.csproj -p:Platform=x64 -p:RuntimeIdentifier=win-x64 -v:minimal
+          if ($LASTEXITCODE -ne 0) { throw "restore failed." }
+
+      - name: Test (optional)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_tests == 'false' }}
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          dotnet test .\tests\DeskBox.Tests\DeskBox.Tests.csproj --configuration Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64 -p:DeskBoxRustNative=false -p:DeskBoxShellThumbnailProxy=false -p:WindowsAppSdkBootstrapInitialize=false --logger "trx;LogFileName=test-results.trx" -v:minimal
+          if ($LASTEXITCODE -ne 0) { throw "tests failed." }
+
+      - name: Publish Native AOT retail
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\scripts\rust-arm64-msvc-environment.ps1
+          $toolchain = Get-DeskBoxMsvcEnvironment -Platform x64
+          $msvcState = Enter-DeskBoxMsvcEnvironment -Toolchain $toolchain
+          try {
+            dotnet publish .\src\DeskBox\DeskBox.csproj `
+              --configuration Release `
+              --output .artifacts\publish `
+              -p:Platform=x64 `
+              -p:RuntimeIdentifier=win-x64 `
+              -p:DeskBoxDistribution=Direct `
+              -p:DeskBoxAotAudit=true `
+              -p:DeskBoxAotSmokeHarness=false `
+              -p:PublishAot=true `
+              -p:DeskBoxRustNative=true `
+              -p:DeskBoxRustCrtLinkage=Static `
+              -p:JsonSerializerIsReflectionEnabledByDefault=false `
+              -p:IlcUseEnvironmentalTools=true `
+              -p:SelfContained=true `
+              -p:WindowsAppSDKSelfContained=true `
+              -p:PublishSingleFile=false `
+              -v:minimal
+            if ($LASTEXITCODE -ne 0) { throw "Native AOT publish failed with exit code $LASTEXITCODE." }
+          }
+          finally {
+            Exit-DeskBoxMsvcEnvironment -State $msvcState
+          }
+
+      - name: Verify retail payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $publish = '.artifacts\publish'
+          $required = @(
+            'DeskBox.exe',
+            'DeskBox.pri',
+            'DeskBox.ThumbnailProxy.exe',
+            'deskbox_native.dll',
+            'Microsoft.WindowsAppRuntime.Insights.Resource.dll'
+          )
+          $missing = @()
+          foreach ($name in $required) {
+            if (-not (Test-Path -LiteralPath (Join-Path $publish $name))) { $missing += $name }
+          }
+          if ($missing.Count -gt 0) { throw "Retail payload is incomplete; missing: $($missing -join ', ')" }
+
+          $pri = Get-Item -LiteralPath (Join-Path $publish 'DeskBox.pri')
+          if ($pri.Length -lt 2000000) {
+            throw "DeskBox.pri is only $($pri.Length) bytes; the merged WinUI resource index is missing."
+          }
+          $exe = Get-Item -LiteralPath (Join-Path $publish 'DeskBox.exe')
+          if ($exe.Length -lt 20000000) {
+            throw "DeskBox.exe is only $($exe.Length) bytes; this is not a Native AOT image."
+          }
+          $proxy = Get-Item -LiteralPath (Join-Path $publish 'DeskBox.ThumbnailProxy.exe')
+          $native = Get-Item -LiteralPath (Join-Path $publish 'deskbox_native.dll')
+          Write-Host "DeskBox.exe        = $($exe.Length) bytes"
+          Write-Host "DeskBox.pri        = $($pri.Length) bytes"
+          Write-Host "ThumbnailProxy.exe = $($proxy.Length) bytes"
+          Write-Host "deskbox_native.dll = $($native.Length) bytes"
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Get-Item '.artifacts\publish\DeskBox.exe').VersionInfo.FileVersion
+          if ([string]::IsNullOrWhiteSpace($version)) { $version = 'dev' }
           "DESKBOX_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          if (-not (Test-Path .artifacts\publish\DeskBox.exe)) { throw "DeskBox.exe was not published." }
           New-Item -ItemType Directory -Path .artifacts\dist -Force | Out-Null
           Compress-Archive -Path .artifacts\publish\* -DestinationPath ".artifacts\dist\DeskBox-DidaSync-$version-win-x64.zip" -Force
           Get-ChildItem .artifacts\dist | Select-Object Name, Length
