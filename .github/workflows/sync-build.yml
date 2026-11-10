@@ -75,8 +75,27 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          dotnet restore .\src\DeskBox\DeskBox.csproj -p:Platform=x64 -p:RuntimeIdentifier=win-x64 -v:minimal
-          if ($LASTEXITCODE -ne 0) { throw "restore failed." }
+          # Restore with the same AOT properties the publish uses, and restore the
+          # Updater project too: publish builds it as a dependency and fails with
+          # NETSDK1004 when its assets file is missing.
+          $common = @(
+            '-p:Platform=x64',
+            '-p:RuntimeIdentifier=win-x64',
+            '-p:DeskBoxDistribution=Direct',
+            '-p:DeskBoxAotAudit=true',
+            '-p:DeskBoxAotSmokeHarness=false',
+            '-p:PublishAot=true',
+            '-p:DeskBoxRustNative=true',
+            '-p:DeskBoxRustCrtLinkage=Static',
+            '-p:JsonSerializerIsReflectionEnabledByDefault=false',
+            '-p:IlcUseEnvironmentalTools=true',
+            '-p:SelfContained=true',
+            '-p:WindowsAppSDKSelfContained=true'
+          )
+          foreach ($project in @('.\src\DeskBox\DeskBox.csproj', '.\src\DeskBox.Updater\DeskBox.Updater.csproj')) {
+            dotnet restore $project @common -v:minimal
+            if ($LASTEXITCODE -ne 0) { throw "restore failed for $project." }
+          }
 
       - name: Test (optional)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_tests == 'false' }}

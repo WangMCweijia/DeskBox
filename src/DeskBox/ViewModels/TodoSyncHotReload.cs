@@ -23,6 +23,10 @@ public sealed partial class TodoWidgetViewModel
 
     internal void AttachSync(TodoWidgetStore store)
     {
+        // The in-process Dida365 engine rides on the same store instance. It is
+        // idempotent: the first Todo widget wins, later widgets are ignored.
+        DidaSyncService.Instance.Attach(store);
+
         DispatcherQueue? queue = DispatcherQueue.GetForCurrentThread();
         if (queue is null)
         {
