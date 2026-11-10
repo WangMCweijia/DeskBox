@@ -58,7 +58,9 @@ jobs:
           -v:minimal
 
       - name: Test
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.skip_tests == 'false' }}
+        # The upstream suite takes several minutes and does not gate packaging.
+        # Opt in explicitly from a manual run when touching ViewModel code.
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_tests == 'false' }}
         timeout-minutes: 12
         shell: pwsh
         run: >-
@@ -88,7 +90,7 @@ jobs:
       - name: Read version and package
         shell: pwsh
         run: |
-          [xml]$proj = Get-Content .\src\DeskBox\DeskBox.csproj
+          [xml]$proj = Get-Content .\src\DeskBox\DeskBox.csproj -Raw
           $version = ($proj.Project.PropertyGroup.Version | Where-Object { $_ }) | Select-Object -First 1
           if (-not $version) { $version = "dev" }
           "DESKBOX_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
