@@ -1,0 +1,4 @@
+config.json
+sync-state.json
+*.log
+__pycache__/
