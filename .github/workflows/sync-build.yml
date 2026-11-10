@@ -136,6 +136,46 @@ jobs:
             Exit-DeskBoxMsvcEnvironment -State $msvcState
           }
 
+      - name: Restore WinAppSDK Insights resource
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # WindowsAppSDK 2.5.1 resolves a Foundation payload whose self-contained
+          # component omits this signed resource DLL; the matching Runtime framework
+          # MSIX carries it. Upstream publish-aot-retail.ps1 extracts it the same way.
+          # Without it, native toast registration fails with 0x8007007E.
+          $assetsPath = 'src/DeskBox/obj/project.assets.json'
+          if (-not (Test-Path -LiteralPath $assetsPath)) { throw "assets file missing: $assetsPath" }
+          $assets = Get-Content -LiteralPath $assetsPath -Raw | ConvertFrom-Json
+          $runtimeLib = $assets.libraries.PSObject.Properties |
+            Where-Object Name -Like 'Microsoft.WindowsAppSDK.Runtime/*' |
+            Select-Object -First 1
+          if (-not $runtimeLib) { throw 'Microsoft.WindowsAppSDK.Runtime package is not restored.' }
+
+          $packageRelativePath = [string]$runtimeLib.Value.path
+          $msixRelative = 'tools/MSIX/win10-x64/Microsoft.WindowsAppRuntime.2.msix'
+          $msix = $null
+          foreach ($root in @($assets.packageFolders.PSObject.Properties.Name)) {
+            $candidate = Join-Path (Join-Path $root $packageRelativePath) $msixRelative
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { $msix = $candidate; break }
+          }
+          if (-not $msix) { throw "framework MSIX not found: $msixRelative" }
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($msix)
+          try {
+            $entry = $archive.Entries |
+              Where-Object { $_.Name -eq 'Microsoft.WindowsAppRuntime.Insights.Resource.dll' } |
+              Select-Object -First 1
+            if (-not $entry) { throw 'Insights resource dll is not inside the framework MSIX.' }
+            $destination = Join-Path '.artifacts/publish' 'Microsoft.WindowsAppRuntime.Insights.Resource.dll'
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $destination, $true)
+            Write-Host "Restored Insights resource from $msix"
+          }
+          finally {
+            $archive.Dispose()
+          }
+
       - name: Verify retail payload
         shell: pwsh
         run: |
