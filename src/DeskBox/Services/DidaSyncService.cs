@@ -55,11 +55,28 @@ internal sealed class DidaApiClient
         string projectId,
         DateTimeOffset start,
         DateTimeOffset end,
+        CancellationToken token) =>
+        await GetCompletedTasksAsync(new[] { projectId }, start, end, token).ConfigureAwait(false);
+
+    /// <summary>
+    /// One round-trip for every synced project: /task/completed accepts a list,
+    /// so a multi-project scope still costs a single request.
+    /// </summary>
+    internal async Task<JsonArray> GetCompletedTasksAsync(
+        IReadOnlyList<string> projectIds,
+        DateTimeOffset start,
+        DateTimeOffset end,
         CancellationToken token)
     {
+        var ids = new JsonArray();
+        foreach (string id in projectIds)
+        {
+            ids.Add(id);
+        }
+
         var body = new JsonObject
         {
-            ["projectIds"] = new JsonArray(projectId),
+            ["projectIds"] = ids,
             ["startDate"] = FormatDida(start),
             ["endDate"] = FormatDida(end)
         };
@@ -296,9 +313,17 @@ internal sealed class DidaSyncService
         string signalPath = Path.Combine(Path.GetDirectoryName(todoPath)!, "todo.sync");
         string statePath = Path.Combine(DeskBoxDataPathService.Current.RootPath, "dida-sync-state.json");
 
-        JsonObject state = LoadState(statePath, config.ProjectId);
+        JsonObject state = LoadState(statePath);
         JsonObject byLocal = state["byLocal"] as JsonObject ?? new JsonObject();
         state["byLocal"] = byLocal;
+
+        IReadOnlyList<string> scope = config.SyncProjectIds;
+        if (scope.Count == 0)
+        {
+            return 0;
+        }
+
+        string primaryProject = config.PrimaryProjectId;
 
         TodoWidgetData local = await store.LoadAsync().ConfigureAwait(false);
         var planned = new Dictionary<string, TodoItem>(StringComparer.Ordinal);
@@ -311,24 +336,31 @@ internal sealed class DidaSyncService
         }
 
         // ---- fetch remote -------------------------------------------------
+        DateTimeOffset now = DateTimeOffset.UtcNow;
         var remote = new JsonObject();
-        foreach (JsonNode? task in await client.GetOpenTasksAsync(config.ProjectId, token).ConfigureAwait(false))
+        var remoteProject = new Dictionary<string, string>(StringComparer.Ordinal);
+
+        foreach (string projectId in scope)
         {
-            if (task is JsonObject obj && obj["id"]?.GetValue<string>() is { Length: > 0 } id)
+            foreach (JsonNode? task in await client.GetOpenTasksAsync(projectId, token).ConfigureAwait(false))
             {
-                remote[id] = obj.DeepClone();
+                if (task is JsonObject obj && obj["id"]?.GetValue<string>() is { Length: > 0 } id)
+                {
+                    remote[id] = obj.DeepClone();
+                    remoteProject[id] = projectId;
+                }
             }
         }
 
-        DateTimeOffset now = DateTimeOffset.UtcNow;
         JsonArray completed = await client
-            .GetCompletedTasksAsync(config.ProjectId, now.AddDays(-config.CompletedLookbackDays), now.AddDays(1), token)
+            .GetCompletedTasksAsync(scope, now.AddDays(-config.CompletedLookbackDays), now.AddDays(1), token)
             .ConfigureAwait(false);
         foreach (JsonNode? task in completed)
         {
             if (task is JsonObject obj && obj["id"]?.GetValue<string>() is { Length: > 0 } id)
             {
                 remote[id] = obj.DeepClone();
+                remoteProject[id] = ResolveScopeProject(obj["projectId"]?.GetValue<string>(), scope, primaryProject);
             }
         }
 
@@ -407,6 +439,9 @@ internal sealed class DidaSyncService
                     byLocal[localId] = new JsonObject
                     {
                         ["remoteId"] = adoptedId,
+                        ["projectId"] = remoteProject.TryGetValue(adoptedId, out string? adoptedProject)
+                            ? adoptedProject
+                            : primaryProject,
                         ["local"] = current.DeepClone(),
                         ["remote"] = NormalizeRemote(adoptedTask).DeepClone()
                     };
@@ -415,7 +450,7 @@ internal sealed class DidaSyncService
                     continue;
                 }
 
-                JsonObject body = LocalToRemoteBody(item, config.ProjectId, null);
+                JsonObject body = LocalToRemoteBody(item, primaryProject, null);
                 JsonObject created = await client.CreateTaskAsync(body, token).ConfigureAwait(false);
                 string? newRemoteId = created["id"]?.GetValue<string>();
                 if (string.IsNullOrWhiteSpace(newRemoteId))
@@ -426,6 +461,7 @@ internal sealed class DidaSyncService
                 byLocal[localId] = new JsonObject
                 {
                     ["remoteId"] = newRemoteId,
+                    ["projectId"] = primaryProject,
                     ["local"] = current.DeepClone(),
                     ["remote"] = new JsonObject()
                 };
@@ -442,18 +478,29 @@ internal sealed class DidaSyncService
             }
 
             string? taskId = mapping["remoteId"]?.GetValue<string>();
+            string mappingProject = mapping["projectId"]?.GetValue<string>() ?? string.Empty;
+            if (mappingProject.Length > 0 && !scope.Contains(mappingProject, StringComparer.Ordinal))
+            {
+                // The owning project left the sync scope. Leave the local copy
+                // untouched instead of re-creating it in a project the user did
+                // not select.
+                continue;
+            }
+
             if (string.IsNullOrWhiteSpace(taskId) || remote[taskId] is not JsonObject remoteTask)
             {
                 // The remote copy is gone (deleted there, or completed long ago).
                 // Re-create it instead of losing the local edit.
                 if (!item.IsDeleted)
                 {
-                    JsonObject body = LocalToRemoteBody(item, config.ProjectId, null);
+                    string recreateProject = mappingProject.Length > 0 ? mappingProject : primaryProject;
+                    JsonObject body = LocalToRemoteBody(item, recreateProject, null);
                     JsonObject created = await client.CreateTaskAsync(body, token).ConfigureAwait(false);
                     string? newRemoteId = created["id"]?.GetValue<string>();
                     if (!string.IsNullOrWhiteSpace(newRemoteId))
                     {
                         mapping["remoteId"] = newRemoteId;
+                        mapping["projectId"] = recreateProject;
                         mapping["local"] = current.DeepClone();
                         mapping["remote"] = new JsonObject();
                         remoteOwner[newRemoteId] = localId;
@@ -476,13 +523,17 @@ internal sealed class DidaSyncService
                 continue;
             }
 
+            string taskProject = remoteProject.TryGetValue(taskId, out string? resolvedProject)
+                ? resolvedProject
+                : (mappingProject.Length > 0 ? mappingProject : primaryProject);
+
             bool wasCompleted = baseline["isCompleted"]?.GetValue<bool>() ?? false;
-            JsonObject updateBody = LocalToRemoteBody(item, config.ProjectId, taskId);
+            JsonObject updateBody = LocalToRemoteBody(item, taskProject, taskId);
             await client.UpdateTaskAsync(taskId, updateBody, token).ConfigureAwait(false);
 
             if (item.IsCompleted && !wasCompleted)
             {
-                await client.CompleteTaskAsync(config.ProjectId, taskId, token).ConfigureAwait(false);
+                await client.CompleteTaskAsync(taskProject, taskId, token).ConfigureAwait(false);
             }
             else if (!item.IsCompleted && wasCompleted)
             {
@@ -490,13 +541,14 @@ internal sealed class DidaSyncService
                 var reopen = new JsonObject
                 {
                     ["id"] = taskId,
-                    ["projectId"] = config.ProjectId,
+                    ["projectId"] = taskProject,
                     ["status"] = 0
                 };
                 await client.UpdateTaskAsync(taskId, reopen, token).ConfigureAwait(false);
             }
 
             mapping["local"] = current.DeepClone();
+            mapping["projectId"] = taskProject;
             pushed.Add(taskId);
             changes++;
             App.Log($"[DidaSync] Pushed local change: {item.Text}");
@@ -507,21 +559,30 @@ internal sealed class DidaSyncService
         {
             // Refresh baselines so our own writes do not echo back as remote edits.
             remote = new JsonObject();
-            foreach (JsonNode? task in await client.GetOpenTasksAsync(config.ProjectId, token).ConfigureAwait(false))
+            remoteProject.Clear();
+            foreach (string projectId in scope)
             {
-                if (task is JsonObject obj && obj["id"]?.GetValue<string>() is { Length: > 0 } id)
+                foreach (JsonNode? task in await client.GetOpenTasksAsync(projectId, token).ConfigureAwait(false))
                 {
-                    remote[id] = obj.DeepClone();
+                    if (task is JsonObject obj && obj["id"]?.GetValue<string>() is { Length: > 0 } id)
+                    {
+                        remote[id] = obj.DeepClone();
+                        remoteProject[id] = projectId;
+                    }
                 }
             }
 
             foreach (JsonNode? task in await client
-                .GetCompletedTasksAsync(config.ProjectId, now.AddDays(-config.CompletedLookbackDays), now.AddDays(1), token)
+                .GetCompletedTasksAsync(scope, now.AddDays(-config.CompletedLookbackDays), now.AddDays(1), token)
                 .ConfigureAwait(false))
             {
                 if (task is JsonObject obj && obj["id"]?.GetValue<string>() is { Length: > 0 } id)
                 {
                     remote[id] = obj.DeepClone();
+                    remoteProject[id] = ResolveScopeProject(
+                        obj["projectId"]?.GetValue<string>(),
+                        scope,
+                        primaryProject);
                 }
             }
         }
@@ -541,6 +602,9 @@ internal sealed class DidaSyncService
                 byLocal[created.Id] = new JsonObject
                 {
                     ["remoteId"] = remoteId,
+                    ["projectId"] = remoteProject.TryGetValue(remoteId, out string? sourceProject)
+                        ? sourceProject
+                        : primaryProject,
                     ["local"] = NormalizeLocal(created).DeepClone(),
                     ["remote"] = NormalizeRemote(task).DeepClone()
                 };
@@ -615,7 +679,14 @@ internal sealed class DidaSyncService
             }
         }
 
-        state["projectId"] = config.ProjectId;
+        state["projectId"] = primaryProject;
+        var scopeNode = new JsonArray();
+        foreach (string projectId in scope)
+        {
+            scopeNode.Add(projectId);
+        }
+
+        state["projectIds"] = scopeNode;
 
         if (localDirty)
         {
@@ -635,6 +706,43 @@ internal sealed class DidaSyncService
         return changes;
     }
 
+    /// <summary>
+    /// Maps a task's own projectId (the Inbox reports a personal id such as
+    /// "inbox1020017597") back onto the project key we sync with.
+    /// </summary>
+    private static string ResolveScopeProject(
+        string? taskProjectId,
+        IReadOnlyList<string> scope,
+        string fallback)
+    {
+        if (string.IsNullOrWhiteSpace(taskProjectId))
+        {
+            return fallback;
+        }
+
+        foreach (string projectId in scope)
+        {
+            if (string.Equals(projectId, taskProjectId, StringComparison.Ordinal))
+            {
+                return projectId;
+            }
+        }
+
+        if (taskProjectId.StartsWith("inbox", StringComparison.OrdinalIgnoreCase))
+        {
+            foreach (string projectId in scope)
+            {
+                if (string.Equals(projectId, "inbox", StringComparison.OrdinalIgnoreCase) ||
+                    projectId.StartsWith("inbox", StringComparison.OrdinalIgnoreCase))
+                {
+                    return projectId;
+                }
+            }
+        }
+
+        return fallback;
+    }
+
     private static async Task WriteSignalAsync(string signalPath, CancellationToken token)
     {
         string payload = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture);
@@ -643,7 +751,7 @@ internal sealed class DidaSyncService
         File.Move(temp, signalPath, overwrite: true);
     }
 
-    private static JsonObject LoadState(string path, string projectId)
+    private static JsonObject LoadState(string path)
     {
         try
         {
@@ -651,10 +759,9 @@ internal sealed class DidaSyncService
             {
                 if (JsonNode.Parse(File.ReadAllText(path)) is JsonObject root)
                 {
-                    if (root["projectId"]?.GetValue<string>() == projectId)
-                    {
-                        return root;
-                    }
+                    // Keep the local mapping across project-scope edits: dropping
+                    // it would re-push every local item as a brand-new task.
+                    return root;
                 }
             }
         }
@@ -665,8 +772,7 @@ internal sealed class DidaSyncService
 
         return new JsonObject
         {
-            ["version"] = 1,
-            ["projectId"] = projectId,
+            ["version"] = 2,
             ["byLocal"] = new JsonObject()
         };
     }

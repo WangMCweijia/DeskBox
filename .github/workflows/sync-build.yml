@@ -10,6 +10,14 @@ name: Build DeskBox with Todo sync (Native AOT)
 on:
   push:
     branches: [main]
+    # Documentation and Python reference changes must not burn an 8-minute
+    # AOT build. Only sources that change the produced binary trigger it.
+    paths:
+      - 'src/**'
+      - 'native/**'
+      - 'scripts/**'
+      - 'patches/**'
+      - '.github/workflows/sync-build.yml'
   workflow_dispatch:
     inputs:
       skip_tests:
@@ -20,7 +28,7 @@ on:
         options: ['true', 'false']
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -213,12 +221,64 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $version = (Get-Item '.artifacts\publish\DeskBox.exe').VersionInfo.FileVersion
+          $exe = Get-Item -LiteralPath '.artifacts\publish\DeskBox.exe'
+          # ProductVersion is InformationalVersion (1.5.9); FileVersion is four
+          # parts (1.5.9.0) and would read as "newer" than the running build.
+          $version = $exe.VersionInfo.ProductVersion
+          if ([string]::IsNullOrWhiteSpace($version)) { $version = $exe.VersionInfo.FileVersion }
+          $version = ($version -split '\+')[0].Trim()
           if ([string]::IsNullOrWhiteSpace($version)) { $version = 'dev' }
           "DESKBOX_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           New-Item -ItemType Directory -Path .artifacts\dist -Force | Out-Null
           Compress-Archive -Path .artifacts\publish\* -DestinationPath ".artifacts\dist\DeskBox-DidaSync-$version-win-x64.zip" -Force
           Get-ChildItem .artifacts\dist | Select-Object Name, Length
+
+      - name: Publish update release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = 'WangMCweijia/DeskBox'
+          $version = $env:DESKBOX_VERSION
+          if ($version -eq 'dev') { Write-Host 'No version stamped; skipping release.'; exit 0 }
+          $tag = "v$version"
+          $zip = Get-ChildItem .artifacts\dist\DeskBox-DidaSync-*-win-x64.zip | Select-Object -First 1
+          if (-not $zip) { throw 'release zip not found.' }
+          $hash = (Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $download = "https://github.com/$repo/releases/download/$tag/$($zip.Name)"
+          # The app verifies downloadUrl against its trusted-prefix allowlist and
+          # compares manifest.version with its InformationalVersion, so the
+          # manifest must carry the plain semantic version.
+          $manifest = [ordered]@{
+            schemaVersion            = 1
+            channel                  = 'stable'
+            version                  = $version
+            releaseDate              = (Get-Date).ToString('yyyy-MM-dd')
+            minimumSupportedVersion  = ''
+            mandatory                = $false
+            downloadUrl              = $download
+            manualDownloadUrl        = "https://github.com/$repo/releases"
+            mirrorUrl                = ''
+            sha256                   = $hash
+            size                     = $zip.Length
+            releaseNotesUrl          = "https://github.com/$repo/releases/tag/$tag"
+            summary                  = [ordered]@{
+              'zh-CN' = "DeskBox $version · 内置滴答清单双向同步"
+              'en-US' = "DeskBox $version with built-in Dida365 sync"
+            }
+          }
+          $manifestPath = '.artifacts\dist\stable.json'
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding utf8
+          Get-Content -LiteralPath $manifestPath
+
+          gh release view $tag --repo $repo 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --repo $repo --title "DeskBox $version" --notes "Native AOT build with Dida365 sync. Download DeskBox-DidaSync-$version-win-x64.zip." 
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed." }
+          }
+          gh release upload $tag "$($zip.FullName)" $manifestPath --clobber --repo $repo
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed." }
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

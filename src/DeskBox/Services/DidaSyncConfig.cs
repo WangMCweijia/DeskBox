@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+using System.Linq;
 using System.Text.Json.Nodes;
 
 namespace DeskBox.Services;
@@ -20,18 +22,52 @@ internal sealed class DidaSyncConfig
 
     public string BaseUrl { get; set; } = DefaultBaseUrl;
 
+    /// <summary>
+    /// Legacy single-project target. Kept so an older dida-sync.json keeps
+    /// working; new writes use <see cref="ProjectIds"/>.
+    /// </summary>
     public string ProjectId { get; set; } = string.Empty;
 
     public string ProjectName { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Projects that feed the single Todo widget. The literal value "inbox"
+    /// stands for the Dida365 Inbox, which is not returned by /project.
+    /// </summary>
+    public List<string> ProjectIds { get; } = new();
 
     public int PollSeconds { get; set; } = 12;
 
     public int CompletedLookbackDays { get; set; } = 7;
 
+    /// <summary>Effective sync scope: explicit list first, legacy field as fallback.</summary>
+    internal IReadOnlyList<string> SyncProjectIds
+    {
+        get
+        {
+            if (ProjectIds.Count > 0)
+            {
+                return ProjectIds;
+            }
+
+            return string.IsNullOrWhiteSpace(ProjectId) ? Array.Empty<string>() : new[] { ProjectId };
+        }
+    }
+
+    /// <summary>Where brand-new DeskBox items are created.</summary>
+    internal string PrimaryProjectId
+    {
+        get
+        {
+            IReadOnlyList<string> ids = SyncProjectIds;
+            return ids.Count > 0 ? ids[0] : string.Empty;
+        }
+    }
+
     public bool IsUsable =>
         Enabled &&
         !string.IsNullOrWhiteSpace(Token) &&
-        !string.IsNullOrWhiteSpace(ProjectId);
+        SyncProjectIds.Count > 0;
 
     internal static string FilePath =>
         Path.Combine(DeskBoxDataPathService.Current.RootPath, FileName);
@@ -63,6 +99,18 @@ internal sealed class DidaSyncConfig
             config.BaseUrl = string.IsNullOrWhiteSpace(baseUrl) ? DefaultBaseUrl : baseUrl.TrimEnd('/');
             config.ProjectId = ReadString(root, "projectId");
             config.ProjectName = ReadString(root, "projectName");
+            if (root["projectIds"] is JsonArray ids)
+            {
+                foreach (JsonNode? node in ids)
+                {
+                    string id = node?.GetValue<string>()?.Trim() ?? string.Empty;
+                    if (id.Length > 0 && !config.ProjectIds.Contains(id, StringComparer.Ordinal))
+                    {
+                        config.ProjectIds.Add(id);
+                    }
+                }
+            }
+
             config.PollSeconds = Math.Clamp(ReadInt(root, "pollSeconds", 12), 5, 600);
             config.CompletedLookbackDays = Math.Clamp(ReadInt(root, "completedLookbackDays", 7), 1, 365);
         }
@@ -76,13 +124,20 @@ internal sealed class DidaSyncConfig
 
     internal void Save()
     {
+        var projectIds = new JsonArray();
+        foreach (string id in SyncProjectIds)
+        {
+            projectIds.Add(id);
+        }
+
         var root = new JsonObject
         {
             ["enabled"] = Enabled,
             ["token"] = Token ?? string.Empty,
             ["baseUrl"] = string.IsNullOrWhiteSpace(BaseUrl) ? DefaultBaseUrl : BaseUrl,
-            ["projectId"] = ProjectId ?? string.Empty,
+            ["projectId"] = PrimaryProjectId,
             ["projectName"] = ProjectName ?? string.Empty,
+            ["projectIds"] = projectIds,
             ["pollSeconds"] = PollSeconds,
             ["completedLookbackDays"] = CompletedLookbackDays
         };

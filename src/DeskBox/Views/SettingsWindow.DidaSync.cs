@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+using System.Linq;
 using System.Text.Json.Nodes;
 using DeskBox.Services;
 using Microsoft.UI.Xaml;
@@ -12,9 +14,14 @@ namespace DeskBox.Views;
 /// dida-sync.json and reads dida-sync-state.json for the last sync status. The
 /// main process re-reads the config on every poll, which means a token typed here
 /// takes effect within one poll interval without any IPC change or restart.
+///
+/// Sync scope is a multi-selection list: the Inbox plus every project the user
+/// ticks ends up merged into the same Todo widget.
 /// </summary>
 public sealed partial class SettingsWindow
 {
+    private const string InboxProjectId = "inbox";
+
     private bool _didaUiInitialized;
     private bool _didaSuppressEvents;
     private DidaSyncConfig _didaConfig = new();
@@ -25,8 +32,8 @@ public sealed partial class SettingsWindow
     private TextBox? DidaTokenInput =>
         FindCreatedSectionElement<TextBox>("TodoSettings", "DidaTokenBox");
 
-    private ComboBox? DidaProjectCombo =>
-        FindCreatedSectionElement<ComboBox>("TodoSettings", "DidaProjectBox");
+    private ListView? DidaProjectList =>
+        FindCreatedSectionElement<ListView>("TodoSettings", "DidaProjectList");
 
     private TextBlock? DidaStatusLabel =>
         FindCreatedSectionElement<TextBlock>("TodoSettings", "DidaStatusText");
@@ -54,11 +61,31 @@ public sealed partial class SettingsWindow
                 input.Text = _didaConfig.Token;
             }
 
-            if (DidaProjectCombo is { } combo && !string.IsNullOrWhiteSpace(_didaConfig.ProjectId))
+            // Seed the list with the saved scope so the page is usable before
+            // "测试并载入清单" is pressed; the connect step replaces it with the
+            // account's real project names.
+            if (DidaProjectList is { } list && list.ItemsSource is null)
             {
-                combo.Items.Clear();
-                combo.Items.Add(new DidaProjectItem(_didaConfig.ProjectId, _didaConfig.ProjectName));
-                combo.SelectedIndex = 0;
+                var seeded = new List<DidaProjectItem>();
+                var seen = new HashSet<string>(StringComparer.Ordinal);
+                IReadOnlyList<string> scopeIds = _didaConfig.SyncProjectIds;
+                string? storedName = !string.IsNullOrWhiteSpace(_didaConfig.ProjectName)
+                    ? _didaConfig.ProjectName
+                    : null;
+                foreach (string id in scopeIds)
+                {
+                    if (seen.Add(id))
+                    {
+                        seeded.Add(new DidaProjectItem(
+                            id,
+                            scopeIds.Count == 1 && storedName is not null ? storedName : DisplayName(id)));
+                    }
+                }
+
+                if (seeded.Count > 0)
+                {
+                    ApplyProjectList(list, seeded, _didaConfig.SyncProjectIds);
+                }
             }
         }
         finally
@@ -91,6 +118,49 @@ public sealed partial class SettingsWindow
         UpdateDidaStatusLabel();
     }
 
+    private void DidaSelectAll_Click(object sender, RoutedEventArgs e)
+    {
+        if (DidaProjectList is not { } list)
+        {
+            return;
+        }
+
+        _didaSuppressEvents = true;
+        try
+        {
+            list.SelectAll();
+        }
+        finally
+        {
+            _didaSuppressEvents = false;
+        }
+
+        PersistDidaConfig();
+        SetDidaStatus("已选中全部清单，点“保存”或等待自动同步。");
+        UpdateDidaStatusLabel();
+    }
+
+    private void DidaSelectNone_Click(object sender, RoutedEventArgs e)
+    {
+        if (DidaProjectList is not { } list)
+        {
+            return;
+        }
+
+        _didaSuppressEvents = true;
+        try
+        {
+            list.SelectedItems.Clear();
+        }
+        finally
+        {
+            _didaSuppressEvents = false;
+        }
+
+        PersistDidaConfig();
+        UpdateDidaStatusLabel();
+    }
+
     private void DidaSave_Click(object sender, RoutedEventArgs e) => PersistAndReport();
 
     private async void DidaConnect_Click(object sender, RoutedEventArgs e)
@@ -109,47 +179,51 @@ public sealed partial class SettingsWindow
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(25));
             JsonArray projects = await client.ListProjectsAsync(timeout.Token);
 
-            ComboBox? combo = DidaProjectCombo;
-            if (combo is null)
+            ListView? list = DidaProjectList;
+            if (list is null)
             {
                 SetDidaStatus("设置界面尚未就绪，请重新打开此页。");
                 return;
             }
 
-            string previousId = (combo.SelectedItem as DidaProjectItem)?.Id ?? _didaConfig.ProjectId;
+            var items = new List<DidaProjectItem>
+            {
+                new(InboxProjectId, "📥 收集箱（Inbox）")
+            };
+            foreach (JsonNode? node in projects)
+            {
+                if (node is not JsonObject project)
+                {
+                    continue;
+                }
+
+                string id = project["id"]?.GetValue<string>() ?? string.Empty;
+                string name = project["name"]?.GetValue<string>() ?? "(未命名清单)";
+                if (string.IsNullOrWhiteSpace(id))
+                {
+                    continue;
+                }
+
+                items.Add(new DidaProjectItem(id, name));
+            }
+
+            if (items.Count == 1)
+            {
+                SetDidaStatus("口令有效，但账号里没有可用的清单。");
+                return;
+            }
+
+            // First run (no saved multi-select scope yet): everything is ticked
+            // so the widget shows the whole account. Afterwards the saved scope
+            // wins.
+            IReadOnlyList<string> wanted = _didaConfig.ProjectIds.Count > 0
+                ? _didaConfig.SyncProjectIds
+                : items.Select(item => item.Id).ToList();
+
             _didaSuppressEvents = true;
             try
             {
-                combo.Items.Clear();
-                int selected = -1;
-                foreach (JsonNode? node in projects)
-                {
-                    if (node is not JsonObject project)
-                    {
-                        continue;
-                    }
-
-                    string id = project["id"]?.GetValue<string>() ?? string.Empty;
-                    string name = project["name"]?.GetValue<string>() ?? "(未命名清单)";
-                    if (string.IsNullOrWhiteSpace(id))
-                    {
-                        continue;
-                    }
-
-                    combo.Items.Add(new DidaProjectItem(id, name));
-                    if (id == previousId)
-                    {
-                        selected = combo.Items.Count - 1;
-                    }
-                }
-
-                if (combo.Items.Count == 0)
-                {
-                    SetDidaStatus("口令有效，但账号里没有可用的清单。");
-                    return;
-                }
-
-                combo.SelectedIndex = selected >= 0 ? selected : 0;
+                ApplyProjectList(list, items, wanted);
             }
             finally
             {
@@ -157,7 +231,8 @@ public sealed partial class SettingsWindow
             }
 
             PersistDidaConfig();
-            SetDidaStatus($"口令有效，已载入 {combo.Items.Count} 个清单。打开上方开关即可开始同步。");
+            int selected = list.SelectedItems.Count;
+            SetDidaStatus($"口令有效，已载入 {items.Count - 1} 个清单，当前选中 {selected} 个（含收集箱）。");
         }
         catch (DidaApiException ex)
         {
@@ -168,6 +243,24 @@ public sealed partial class SettingsWindow
         catch (Exception ex)
         {
             SetDidaStatus("验证失败：" + ex.Message);
+        }
+    }
+
+    private void ApplyProjectList(
+        ListView list,
+        IReadOnlyList<DidaProjectItem> items,
+        IReadOnlyCollection<string> selectedIds)
+    {
+        list.ItemsSource = null;
+        list.SelectedItems.Clear();
+        list.ItemsSource = items;
+
+        foreach (DidaProjectItem item in items)
+        {
+            if (selectedIds.Contains(item.Id))
+            {
+                list.SelectedItems.Add(item);
+            }
         }
     }
 
@@ -186,10 +279,24 @@ public sealed partial class SettingsWindow
 
         _didaConfig.Enabled = DidaEnabledSwitch?.IsOn ?? false;
         _didaConfig.Token = DidaTokenInput?.Text?.Trim() ?? string.Empty;
-        if (DidaProjectCombo?.SelectedItem is DidaProjectItem project)
+
+        ListView? list = DidaProjectList;
+        if (list?.ItemsSource is not null)
         {
-            _didaConfig.ProjectId = project.Id;
-            _didaConfig.ProjectName = project.Name;
+            var ids = new List<string>();
+            var names = new List<string>();
+            foreach (object entry in list.SelectedItems)
+            {
+                if (entry is DidaProjectItem item)
+                {
+                    ids.Add(item.Id);
+                    names.Add(item.Name);
+                }
+            }
+
+            _didaConfig.ProjectIds.Clear();
+            _didaConfig.ProjectIds.AddRange(ids);
+            _didaConfig.ProjectName = ShortenScope(names);
         }
 
         try
@@ -205,17 +312,23 @@ public sealed partial class SettingsWindow
 
     private void UpdateDidaStatusLabel()
     {
+        IReadOnlyList<string> scope = _didaConfig.SyncProjectIds;
+
         if (!_didaConfig.Enabled)
         {
-            SetDidaStatus("未启用。填入 API 口令、选好清单，再打开开关。");
+            SetDidaStatus("未启用。填入 API 口令、勾选清单，再打开开关。");
             return;
         }
 
-        if (string.IsNullOrWhiteSpace(_didaConfig.Token) || string.IsNullOrWhiteSpace(_didaConfig.ProjectId))
+        if (string.IsNullOrWhiteSpace(_didaConfig.Token) || scope.Count == 0)
         {
             SetDidaStatus("已启用，但还缺 API 口令或同步清单。");
             return;
         }
+
+        string scopeLabel = scope.Count == 1
+            ? DisplayName(scope[0])
+            : $"{scope.Count} 个清单";
 
         string statePath = Path.Combine(DeskBoxDataPathService.Current.RootPath, "dida-sync-state.json");
         try
@@ -224,7 +337,7 @@ public sealed partial class SettingsWindow
                 JsonNode.Parse(File.ReadAllText(statePath)) is JsonObject state &&
                 state["lastStatus"]?.GetValue<string>() is { Length: > 0 } status)
             {
-                SetDidaStatus("清单：" + _didaConfig.ProjectName + "　·　" + status);
+                SetDidaStatus("同步范围：" + scopeLabel + "　·　" + status);
                 return;
             }
         }
@@ -233,7 +346,23 @@ public sealed partial class SettingsWindow
             App.Log($"[DidaSync] Status read failed: {ex.Message}");
         }
 
-        SetDidaStatus("已启用，等待首次同步（清单：" + _didaConfig.ProjectName + "）。");
+        SetDidaStatus("已启用，等待首次同步（同步范围：" + scopeLabel + "）。");
+    }
+
+    private static string DisplayName(string projectId) =>
+        string.Equals(projectId, InboxProjectId, StringComparison.OrdinalIgnoreCase)
+            ? "📥 收集箱（Inbox）"
+            : projectId;
+
+    private static string ShortenScope(List<string> names)
+    {
+        if (names.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        string joined = string.Join("、", names);
+        return joined.Length <= 60 ? joined : joined[..60] + "…";
     }
 
     private void SetDidaStatus(string text)
@@ -245,7 +374,7 @@ public sealed partial class SettingsWindow
     }
 }
 
-/// <summary>ComboBox row for a Dida365 project. ToString drives the display.</summary>
+/// <summary>Checkable row for a Dida365 project. ToString drives the display.</summary>
 internal sealed class DidaProjectItem
 {
     internal DidaProjectItem(string id, string name)

@@ -24,10 +24,49 @@ import sys
 VIEW_MODEL = pathlib.Path("src/DeskBox/ViewModels/TodoWidgetViewModel.cs")
 HOT_RELOAD = pathlib.Path("src/DeskBox/ViewModels/TodoSyncHotReload.cs")
 SETTINGS_XAML = pathlib.Path("src/DeskBox/Views/SettingsWindow.xaml")
+SETTINGS_VM = pathlib.Path("src/DeskBox/ViewModels/SettingsViewModel.cs")
+UPDATE_SERVICE = pathlib.Path("src/DeskBox/Services/AppUpdateService.cs")
 
 MARKER_CTOR = "AttachSync(_store);"
 MARKER_DISPOSE = "DetachSync();"
 MARKER_XAML = 'x:Name="DidaSyncEnabledSwitch"'
+MARKER_BRANDING = "WangMCweijia"
+
+# Rebranding: this fork keeps the app pointing at its own repository instead of
+# the upstream site. Every entry is (file, old, new) and is skipped when the
+# new text is already present, so re-running is a no-op.
+BRAND_REPO_URL = "https://github.com/WangMCweijia/DeskBox"
+BRAND_RELEASES_URL = "https://github.com/WangMCweijia/DeskBox/releases"
+BRAND_MANIFEST_URL = (
+    "https://github.com/WangMCweijia/DeskBox/releases/latest/download/stable.json"
+)
+BRAND_RELEASE_API = "https://api.github.com/repos/WangMCweijia/DeskBox/releases/latest"
+BRAND_DOWNLOAD_PREFIX = "/WangMCweijia/DeskBox/releases/download/"
+
+BRAND_REPLACEMENTS = (
+    (SETTINGS_VM, 'private const string RepositoryUrl = "https://github.com/Tianyu199509/DeskBox";',
+     f'private const string RepositoryUrl = "{BRAND_REPO_URL}";'),
+    (SETTINGS_VM, 'private const string OfficialWebsiteUrl = "https://deskbox.fun";',
+     f'private const string OfficialWebsiteUrl = "{BRAND_REPO_URL}";'),
+    (UPDATE_SERVICE, 'public const string DefaultManifestUrl = "https://deskbox.fun/update/stable.json";',
+     f'public const string DefaultManifestUrl = "{BRAND_MANIFEST_URL}";'),
+    (UPDATE_SERVICE,
+     'public const string DefaultGitHubLatestReleaseApiUrl = "https://api.github.com/repos/Tianyu199509/DeskBox/releases/latest";',
+     f'public const string DefaultGitHubLatestReleaseApiUrl = "{BRAND_RELEASE_API}";'),
+    (UPDATE_SERVICE, 'public const string DefaultManualDownloadUrl = "https://deskbox.fun/download";',
+     f'public const string DefaultManualDownloadUrl = "{BRAND_RELEASES_URL}";'),
+    (UPDATE_SERVICE, '"/Tianyu199509/DeskBox/releases/download/"',
+     f'"{BRAND_DOWNLOAD_PREFIX}"'),
+    (UPDATE_SERVICE, '"https://github.com/Tianyu199509/DeskBox/releases/tag/v{version.Trim()}"',
+     '"https://github.com/WangMCweijia/DeskBox/releases/tag/v{version.Trim()}"'),
+)
+
+ABOUT_ME_BUTTON_RE = re.compile(
+    r'[ \t]*<Button\s+x:Name="AboutMeButton"[\s\S]*?</Button>\r?\n'
+)
+ABOUT_SITE_BUTTON_RE = re.compile(
+    r'[ \t]*<Button\s+x:Name="AboutWebsiteButton"[\s\S]*?</Button>\r?\n'
+)
 
 CTOR_RE = re.compile(
     r"(?m)^(?P<body>\s*)_localizationService\.LanguageChanged \+= OnLanguageChanged;\n"
@@ -61,8 +100,18 @@ DIDA_XAML = """                            <toolkit:SettingsExpander
                                             </StackPanel>
                                         </StackPanel>
                                     </toolkit:SettingsCard>
-                                    <toolkit:SettingsCard HorizontalContentAlignment="Stretch" Description="DeskBox 的待办会落到这个清单">
-                                        <ComboBox x:Name="DidaProjectBox" HorizontalAlignment="Stretch" SelectionChanged="DidaProject_SelectionChanged" />
+                                    <toolkit:SettingsCard HorizontalContentAlignment="Stretch" Description="勾选要汇总到 DeskBox 的清单，可多选；收集箱也在里面">
+                                        <StackPanel Spacing="8">
+                                            <ListView x:Name="DidaProjectList"
+                                                      HorizontalAlignment="Stretch"
+                                                      MaxHeight="220"
+                                                      SelectionMode="Multiple"
+                                                      SelectionChanged="DidaProject_SelectionChanged" />
+                                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                                <Button Content="全选" Click="DidaSelectAll_Click" />
+                                                <Button Content="全不选" Click="DidaSelectNone_Click" />
+                                            </StackPanel>
+                                        </StackPanel>
                                     </toolkit:SettingsCard>
                                     <toolkit:SettingsCard HorizontalContentAlignment="Stretch">
                                         <TextBlock x:Name="DidaStatusText" TextWrapping="Wrap" Text="未配置" />
@@ -169,6 +218,74 @@ def patch_settings_xaml(check: bool) -> int:
     return 0
 
 
+def strip_about_buttons(check: bool) -> int:
+    """Drop the upstream "about me" and "official website" buttons."""
+    if not SETTINGS_XAML.is_file():
+        print(f"MISSING: {SETTINGS_XAML}", file=sys.stderr)
+        return 2
+
+    text, has_bom, newline = read_text(SETTINGS_XAML)
+    removed = 0
+    for pattern in (ABOUT_ME_BUTTON_RE, ABOUT_SITE_BUTTON_RE):
+        text, count = pattern.subn("", text)
+        removed += count
+
+    if removed == 0:
+        print("OK: about buttons already removed.")
+        return 0
+
+    if check:
+        print("MISSING: about buttons are still in the XAML.", file=sys.stderr)
+        return 1
+
+    write_text(SETTINGS_XAML, text, has_bom, newline)
+    print(f"removed: {removed} about button(s) from SettingsWindow.xaml")
+    return 0
+
+
+def patch_branding(check: bool) -> int:
+    """Point the About page and the update feed at this fork."""
+    per_file: dict[pathlib.Path, list[tuple[str, str]]] = {}
+    for path, old, new in BRAND_REPLACEMENTS:
+        per_file.setdefault(path, []).append((old, new))
+
+    pending: dict[pathlib.Path, tuple[str, bool, str]] = {}
+    for path, pairs in per_file.items():
+        if not path.is_file():
+            print(f"MISSING: {path}", file=sys.stderr)
+            return 2
+
+        text, has_bom, newline = read_text(path)
+        changed = False
+        for old, new in pairs:
+            if new in text:
+                continue
+            if old not in text:
+                print(
+                    f"ERROR: branding anchor missing in {path}: {old[:70]}",
+                    file=sys.stderr,
+                )
+                return 3
+            text = text.replace(old, new)
+            changed = True
+
+        if changed:
+            pending[path] = (text, has_bom, newline)
+
+    if not pending:
+        print("OK: branding already points at the fork.")
+        return 0
+
+    if check:
+        print("MISSING: branding replacements are not applied.", file=sys.stderr)
+        return 1
+
+    for path, (text, has_bom, newline) in pending.items():
+        write_text(path, text, has_bom, newline)
+        print(f"patched: branding in {path}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="verify only")
@@ -178,7 +295,7 @@ def main() -> int:
         print(f"MISSING: {HOT_RELOAD}", file=sys.stderr)
         return 2
 
-    for step in (patch_view_model, patch_settings_xaml):
+    for step in (patch_view_model, patch_settings_xaml, patch_branding, strip_about_buttons):
         result = step(args.check)
         if result != 0:
             return result
