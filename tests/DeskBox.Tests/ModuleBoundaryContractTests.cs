@@ -489,6 +489,11 @@ public sealed class ModuleBoundaryContractTests
         ["src/DeskBox/App.xaml.cs"] = 4,
         ["src/DeskBox/Helpers/NativeDropTarget.cs"] = 5,
         ["src/DeskBox/Services/AotShellMoveFixture.cs"] = 1,
+        // Dida365 sync writes JSON atomically (temp file + File.Move): the
+        // hot-reload signal, the sync state, and dida-sync.json itself.
+        ["src/DeskBox/Services/DidaSyncConfig.cs"] = 1,
+        ["src/DeskBox/Services/DidaSyncService.cs"] = 2,
+        ["src/DeskBox/Services/TodoUiOptions.cs"] = 1,
         // +1: retiring a downloaded installer reclaims its version-scoped
         // directory under the updates root (TryDeleteRetiredInstallerDirectory).
         // +2: the startup sweep (PruneStaleInstallerDirectories) deletes
