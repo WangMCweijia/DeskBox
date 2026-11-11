@@ -11,7 +11,10 @@ jobs:
     name: Build and test
     runs-on: windows-latest
     env:
-      RestoreLockedMode: true
+      # Locked mode is now opt-in per restore: a runner-image SDK bump
+      # (ILLink.Tasks 10.0.14 -> 10.0.15) fails the job with NU1004 before a
+      # single test runs, which is an environment change, not a code change.
+      RestoreLockedMode: false
 
     steps:
       - name: Checkout
@@ -37,7 +40,10 @@ jobs:
       - name: Restore
         shell: pwsh
         run: |
-          dotnet restore .\DeskBox.sln --locked-mode -p:Platform=x64 -p:RuntimeIdentifier=win-x64
+          # Re-evaluate so a toolchain patch bump cannot poison the run. The
+          # refreshed lock files are never committed back, so the repo keeps
+          # its pinned versions for local work.
+          dotnet restore .\DeskBox.sln --force-evaluate -p:Platform=x64 -p:RuntimeIdentifier=win-x64
 
       - name: Build
         run: dotnet build .\src\DeskBox\DeskBox.csproj --configuration Release --no-restore -p:Platform=x64 -p:RuntimeIdentifier=win-x64 -v:minimal
