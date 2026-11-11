@@ -90,6 +90,43 @@ ABOUT_SITE_BUTTON_RE = re.compile(
     r'[ \t]*<Button\s+x:Name="AboutWebsiteButton"[\s\S]*?</Button>\r?\n'
 )
 
+APP_CS = pathlib.Path("src/DeskBox/App.xaml.cs")
+
+CSPROJ = pathlib.Path("src/DeskBox/DeskBox.csproj")
+OLD_VERSION = "1.5.9"
+NEW_VERSION = "1.5.10"
+
+# Logon autostart must stay window-less: the startup drain near
+# CompleteExternalActivationInitializationAsync calls the activation handler
+# with no pending activation, and the handler treats every bare activation as
+# "show settings". A parameter distinguishes the idle drain from a real user
+# activation, and the guard keeps manual launches (double-clicking the exe)
+# opening settings as before.
+AUTOSTART_SIG = "    private async Task HandleExternalActivationAsync()"
+AUTOSTART_SIG_NEW = (
+    "    private async Task HandleExternalActivationAsync(bool allowBareSettings = true)"
+)
+AUTOSTART_GUARD_ANCHOR = (
+    "                OpenSettings();\n"
+    "\n"
+    "                // The first interactive activation of a startup-mode session"
+)
+AUTOSTART_GUARD = (
+    "                if (!allowBareSettings && IsStartupMode)\n"
+    "                {\n"
+    "                    // Logon autostart: this drain runs with no pending\n"
+    "                    // activation, so opening settings here would pop a\n"
+    "                    // window on every boot. The widgets are already\n"
+    "                    // restored; settings opens from the tray on demand.\n"
+    '                    Log("[Activation] Autostart drain: settings stays closed");\n'
+    "                    continue;\n"
+    "                }\n"
+    "\n"
+)
+MARKER_AUTOSTART_SIG = "bool allowBareSettings = true"
+MARKER_AUTOSTART_CALL = "HandleExternalActivationAsync(allowBareSettings: false)"
+MARKER_AUTOSTART_GUARD = "Autostart drain: settings stays closed"
+
 TEST_CONTRACT = pathlib.Path("tests/DeskBox.Tests/ModuleBoundaryContractTests.cs")
 MARKER_BUDGET = '["src/DeskBox/Services/DidaSyncService.cs"]'
 MARKER_BUDGET_UI = '["src/DeskBox/Services/TodoUiOptions.cs"]'
@@ -410,6 +447,127 @@ def patch_test_budget(check: bool) -> int:
     return 0
 
 
+def patch_autostart_no_settings(check: bool) -> int:
+    """Stop the logon autostart from popping the settings window.
+
+    ``CompleteExternalActivationInitializationAsync`` always calls the
+    activation handler once — even when no activation is pending — purely to
+    drain stale intent files. That call lands in the bare-activation branch,
+    which opens settings, so every boot ends with a settings window on top of
+    the widgets. The idle drain passes ``allowBareSettings: false``; the guard
+    then skips the window while still honoring a real activation (a manual
+    double-click signals the event, and the listener calls with the default).
+    """
+    if not APP_CS.is_file():
+        print(f"MISSING: {APP_CS}", file=sys.stderr)
+        return 2
+
+    text, has_bom, newline = read_text(APP_CS)
+    if all(
+        marker in text
+        for marker in (
+            MARKER_AUTOSTART_SIG,
+            MARKER_AUTOSTART_CALL,
+            MARKER_AUTOSTART_GUARD,
+        )
+    ):
+        print("OK: autostart keeps the settings window closed.")
+        return 0
+
+    if check:
+        print("MISSING: autostart still opens the settings window.", file=sys.stderr)
+        return 1
+
+    if MARKER_AUTOSTART_SIG not in text:
+        if AUTOSTART_SIG not in text:
+            print(
+                "ERROR: activation handler signature changed upstream; patch by hand.",
+                file=sys.stderr,
+            )
+            return 3
+        text = text.replace(AUTOSTART_SIG, AUTOSTART_SIG_NEW, 1)
+        print("patched: activation handler accepts allowBareSettings")
+
+    if MARKER_AUTOSTART_CALL not in text:
+        needle = "await HandleExternalActivationAsync();"
+        if text.count(needle) != 2:
+            print(
+                "ERROR: expected two bare activation calls, found "
+                f"{text.count(needle)}; patch by hand.",
+                file=sys.stderr,
+            )
+            return 3
+        head, separator, tail = text.partition(needle)
+        text = (
+            head
+            + separator
+            + tail.replace(
+                needle,
+                "await HandleExternalActivationAsync(allowBareSettings: false);",
+                1,
+            )
+        )
+        print("patched: idle startup drain skips the settings window")
+
+    if MARKER_AUTOSTART_GUARD not in text:
+        if AUTOSTART_GUARD_ANCHOR not in text:
+            print(
+                "ERROR: bare-activation OpenSettings anchor changed upstream.",
+                file=sys.stderr,
+            )
+            return 3
+        text = text.replace(
+            AUTOSTART_GUARD_ANCHOR,
+            AUTOSTART_GUARD + AUTOSTART_GUARD_ANCHOR,
+            1,
+        )
+        print("patched: autostart guard before OpenSettings")
+
+    write_text(APP_CS, text, has_bom, newline)
+    print("OK: autostart keeps the settings window closed.")
+    return 0
+
+
+def patch_version(check: bool) -> int:
+    """Stamp this fork's own version so builds never overwrite an old asset.
+
+    The workflow derives the tag from ProductVersion and uploads with
+    --clobber; reusing a released tag risks GitHub's edge cache serving the
+    previous zip for the same asset name, i.e. shipping the old binary.
+    """
+    if not CSPROJ.is_file():
+        print(f"MISSING: {CSPROJ}", file=sys.stderr)
+        return 2
+
+    text, has_bom, newline = read_text(CSPROJ)
+    if f"<Version>{NEW_VERSION}</Version>" in text:
+        print(f"OK: version already stamped {NEW_VERSION}.")
+        return 0
+
+    if check:
+        print(f"MISSING: version is not stamped {NEW_VERSION}.", file=sys.stderr)
+        return 1
+
+    replaced = 0
+    for element in ("Version", "AssemblyVersion", "FileVersion", "InformationalVersion"):
+        old = f"<{element}>{OLD_VERSION}"
+        new = f"<{element}>{NEW_VERSION}"
+        if old in text and new not in text:
+            text = text.replace(old, new)
+            replaced += 1
+
+    if replaced == 0:
+        print(
+            f"WARN: no {OLD_VERSION} stamp found in {CSPROJ}; leaving as-is.",
+            file=sys.stderr,
+        )
+        return 0
+
+    write_text(CSPROJ, text, has_bom, newline)
+    print(f"patched: version {OLD_VERSION} -> {NEW_VERSION} ({replaced} fields)")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="verify only")
@@ -425,6 +583,8 @@ def main() -> int:
         patch_branding,
         strip_about_buttons,
         patch_todo_ui,
+        patch_autostart_no_settings,
+        patch_version,
         patch_test_budget,
     ):
         result = step(args.check)
