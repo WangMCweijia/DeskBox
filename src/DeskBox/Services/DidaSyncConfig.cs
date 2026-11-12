@@ -1,5 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace DeskBox.Services;
@@ -124,23 +126,29 @@ internal sealed class DidaSyncConfig
 
     internal void Save()
     {
-        var projectIds = new JsonArray();
-        foreach (string id in SyncProjectIds)
+        // Utf8JsonWriter, not JsonObject: an AOT build has no reflection
+        // serializer metadata, so `new JsonObject { ["token"] = Token }` throws
+        // NotSupportedException and the settings page could never persist.
+        using var buffer = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions { Indented = true }))
         {
-            projectIds.Add(id);
-        }
+            writer.WriteStartObject();
+            writer.WriteBoolean("enabled", Enabled);
+            writer.WriteString("token", Token ?? string.Empty);
+            writer.WriteString("baseUrl", string.IsNullOrWhiteSpace(BaseUrl) ? DefaultBaseUrl : BaseUrl);
+            writer.WriteString("projectId", PrimaryProjectId);
+            writer.WriteString("projectName", ProjectName ?? string.Empty);
+            writer.WriteStartArray("projectIds");
+            foreach (string id in SyncProjectIds)
+            {
+                writer.WriteStringValue(id);
+            }
 
-        var root = new JsonObject
-        {
-            ["enabled"] = Enabled,
-            ["token"] = Token ?? string.Empty,
-            ["baseUrl"] = string.IsNullOrWhiteSpace(BaseUrl) ? DefaultBaseUrl : BaseUrl,
-            ["projectId"] = PrimaryProjectId,
-            ["projectName"] = ProjectName ?? string.Empty,
-            ["projectIds"] = projectIds,
-            ["pollSeconds"] = PollSeconds,
-            ["completedLookbackDays"] = CompletedLookbackDays
-        };
+            writer.WriteEndArray();
+            writer.WriteNumber("pollSeconds", PollSeconds);
+            writer.WriteNumber("completedLookbackDays", CompletedLookbackDays);
+            writer.WriteEndObject();
+        }
 
         string path = FilePath;
         string? directory = Path.GetDirectoryName(path);
@@ -150,7 +158,7 @@ internal sealed class DidaSyncConfig
         }
 
         string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-        File.WriteAllText(temp, root.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+        File.WriteAllText(temp, Encoding.UTF8.GetString(buffer.ToArray()));
         File.Move(temp, path, overwrite: true);
     }
 

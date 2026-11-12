@@ -30,6 +30,7 @@ UPDATE_SERVICE = pathlib.Path("src/DeskBox/Services/AppUpdateService.cs")
 
 MARKER_CTOR = "AttachSync(_store);"
 MARKER_DISPOSE = "DetachSync();"
+MARKER_TIME_TICKER = "AttachRelativeTimeTicker();"
 MARKER_XAML = 'x:Name="DidaSyncEnabledSwitch"'
 MARKER_TODO_UI = 'x:Name="TodoColorFilterSwitch"'
 MARKER_BRANDING = "WangMCweijia"
@@ -94,7 +95,7 @@ APP_CS = pathlib.Path("src/DeskBox/App.xaml.cs")
 
 CSPROJ = pathlib.Path("src/DeskBox/DeskBox.csproj")
 OLD_VERSION = "1.5.9"
-NEW_VERSION = "1.5.10"
+NEW_VERSION = "1.5.11"
 
 # Logon autostart must stay window-less: the startup drain near
 # CompleteExternalActivationInitializationAsync calls the activation handler
@@ -260,6 +261,42 @@ def patch_view_model(check: bool) -> int:
 
     write_text(VIEW_MODEL, text, has_bom, newline)
     print("OK: Todo sync wiring applied.")
+    return 0
+
+
+def patch_relative_time_ticker(check: bool) -> int:
+    """Recompute "today / tomorrow" labels when the calendar day flips.
+
+    The due label is a getter over DateTimeOffset.Now that the UI only re-reads
+    on a change notification, and the widget deliberately stays on the desktop
+    for days. Without this, a task due 11-12 11:00 keeps reading "明天 11:00" on
+    11-12 because that text was produced on 11-11.
+    """
+    if not VIEW_MODEL.is_file():
+        print(f"MISSING: {VIEW_MODEL}", file=sys.stderr)
+        return 2
+
+    text, has_bom, newline = read_text(VIEW_MODEL)
+    if MARKER_TIME_TICKER in text:
+        print("OK: relative-time ticker already wired.")
+        return 0
+
+    if check:
+        print("MISSING: relative-time ticker is not wired.", file=sys.stderr)
+        return 1
+
+    pattern = re.compile(r"(?P<indent>[ \t]*)AttachSync\(_store\);")
+    replacement = (
+        lambda m: f"{m.group('indent')}AttachSync(_store);\n"
+                  f"{m.group('indent')}{MARKER_TIME_TICKER}"
+    )
+    text, count = pattern.subn(replacement, text, count=1)
+    if count == 0:
+        print("ERROR: sync wiring anchor missing; run patch_view_model first.", file=sys.stderr)
+        return 3
+
+    write_text(VIEW_MODEL, text, has_bom, newline)
+    print("patched: AttachRelativeTimeTicker() in constructor")
     return 0
 
 
@@ -549,16 +586,22 @@ def patch_version(check: bool) -> int:
         return 1
 
     replaced = 0
-    for element in ("Version", "AssemblyVersion", "FileVersion", "InformationalVersion"):
-        old = f"<{element}>{OLD_VERSION}"
-        new = f"<{element}>{NEW_VERSION}"
-        if old in text and new not in text:
-            text = text.replace(old, new)
-            replaced += 1
+    # Rewrite whatever stamping upstream ships with instead of matching one exact
+    # old number: the fork's own previous stamp (1.5.10) is also "old" here.
+    targets = {
+        "Version": NEW_VERSION,
+        "InformationalVersion": NEW_VERSION,
+        "AssemblyVersion": NEW_VERSION + ".0",
+        "FileVersion": NEW_VERSION + ".0",
+    }
+    for element, value in targets.items():
+        pattern = re.compile(rf"<{element}>[0-9][0-9.]*</{element}>")
+        text, count = pattern.subn(f"<{element}>{value}</{element}>", text)
+        replaced += count
 
     if replaced == 0:
         print(
-            f"WARN: no {OLD_VERSION} stamp found in {CSPROJ}; leaving as-is.",
+            f"WARN: no version stamp found in {CSPROJ}; leaving as-is.",
             file=sys.stderr,
         )
         return 0
@@ -579,6 +622,7 @@ def main() -> int:
 
     for step in (
         patch_view_model,
+        patch_relative_time_ticker,
         patch_settings_xaml,
         patch_branding,
         strip_about_buttons,

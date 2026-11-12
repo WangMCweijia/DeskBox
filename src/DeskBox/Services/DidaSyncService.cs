@@ -3,6 +3,7 @@ using System.Linq;
 using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using DeskBox.Models;
 
@@ -20,8 +21,14 @@ internal sealed class DidaApiException : Exception
 
 /// <summary>
 /// Thin client over the Dida365 Open API (api.dida365.com/open/v1).
-/// Every call is a plain JSON round-trip so it stays Native AOT friendly:
-/// no reflection-based serializers, only <see cref="JsonNode"/>.
+///
+/// Request bodies are produced by <see cref="Utf8JsonWriter"/> and handed over as
+/// plain strings. Building them through <see cref="JsonNode"/> looks tidier but
+/// dies under Native AOT: <c>JsonObject["key"] = "text"</c> routes through
+/// <c>JsonNode.ConvertFromValue</c>, which asks <c>JsonSerializerOptions.Default</c>
+/// for type metadata, and an AOT build only has an empty resolver — every write
+/// threw <c>NotSupportedException</c> while reads kept working. Responses are still
+/// parsed with <see cref="JsonNode.Parse"/>, which needs no metadata.
 /// </summary>
 internal sealed class DidaApiClient
 {
@@ -52,12 +59,12 @@ internal sealed class DidaApiClient
         return data is JsonObject obj && obj["tasks"] is JsonArray tasks ? tasks : new JsonArray();
     }
 
-    internal async Task<JsonArray> GetCompletedTasksAsync(
+    internal Task<JsonArray> GetCompletedTasksAsync(
         string projectId,
         DateTimeOffset start,
         DateTimeOffset end,
         CancellationToken token) =>
-        await GetCompletedTasksAsync(new[] { projectId }, start, end, token).ConfigureAwait(false);
+        GetCompletedTasksAsync(new[] { projectId }, start, end, token);
 
     /// <summary>
     /// One round-trip for every synced project: /task/completed accepts a list,
@@ -69,29 +76,29 @@ internal sealed class DidaApiClient
         DateTimeOffset end,
         CancellationToken token)
     {
-        var ids = new JsonArray();
-        foreach (string id in projectIds)
+        string body = DidaJson.Build(writer =>
         {
-            ids.Add(id);
-        }
+            writer.WriteStartArray("projectIds");
+            foreach (string id in projectIds)
+            {
+                writer.WriteStringValue(id);
+            }
 
-        var body = new JsonObject
-        {
-            ["projectIds"] = ids,
-            ["startDate"] = FormatDida(start),
-            ["endDate"] = FormatDida(end)
-        };
+            writer.WriteEndArray();
+            writer.WriteString("startDate", FormatDida(start));
+            writer.WriteString("endDate", FormatDida(end));
+        });
 
         return await SendArrayAsync(HttpMethod.Post, "/task/completed", body, token).ConfigureAwait(false);
     }
 
-    internal async Task<JsonObject> CreateTaskAsync(JsonObject body, CancellationToken token)
+    internal async Task<JsonObject> CreateTaskAsync(string body, CancellationToken token)
     {
         JsonNode? created = await SendAsync(HttpMethod.Post, "/task", body, token).ConfigureAwait(false);
         return created as JsonObject ?? new JsonObject();
     }
 
-    internal Task UpdateTaskAsync(string taskId, JsonObject body, CancellationToken token) =>
+    internal Task UpdateTaskAsync(string taskId, string body, CancellationToken token) =>
         SendAsync(HttpMethod.Post, "/task/" + Uri.EscapeDataString(taskId), body, token);
 
     internal Task CompleteTaskAsync(string projectId, string taskId, CancellationToken token) =>
@@ -104,7 +111,7 @@ internal sealed class DidaApiClient
     private async Task<JsonArray> SendArrayAsync(
         HttpMethod method,
         string path,
-        JsonNode? body,
+        string? body,
         CancellationToken token)
     {
         JsonNode? result = await SendAsync(method, path, body, token).ConfigureAwait(false);
@@ -114,16 +121,16 @@ internal sealed class DidaApiClient
     private async Task<JsonNode?> SendAsync(
         HttpMethod method,
         string path,
-        JsonNode? body,
+        string? body,
         CancellationToken token)
     {
         using var request = new HttpRequestMessage(method, _baseUrl + path);
         request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + _token);
         request.Headers.TryAddWithoutValidation("Accept", "application/json");
-        request.Headers.TryAddWithoutValidation("User-Agent", "DeskBox-DidaSync/2.0");
-        if (body is not null)
+        request.Headers.TryAddWithoutValidation("User-Agent", "DeskBox-DidaSync/2.1");
+        if (!string.IsNullOrEmpty(body))
         {
-            request.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
+            request.Content = new StringContent(body, Encoding.UTF8, "application/json");
         }
 
         HttpResponseMessage response;
@@ -178,6 +185,143 @@ internal sealed class DidaApiClient
 
     internal static string FormatDida(DateTimeOffset value) =>
         value.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'+0000'", CultureInfo.InvariantCulture);
+}
+
+/// <summary>
+/// Native AOT safe JSON text helpers. Nothing here touches the reflection based
+/// serializer: values are streamed straight into <see cref="Utf8JsonWriter"/>.
+/// </summary>
+internal static class DidaJson
+{
+    internal static string Build(Action<Utf8JsonWriter> writeProperties)
+    {
+        using var buffer = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(buffer))
+        {
+            writer.WriteStartObject();
+            writeProperties(writer);
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(buffer.ToArray());
+    }
+
+    internal static string BuildArray(Action<Utf8JsonWriter> writeItems)
+    {
+        using var buffer = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(buffer))
+        {
+            writer.WriteStartArray();
+            writeItems(writer);
+            writer.WriteEndArray();
+        }
+
+        return Encoding.UTF8.GetString(buffer.ToArray());
+    }
+
+    /// <summary>Serialises an already parsed node without a type resolver.</summary>
+    internal static string Text(JsonNode? node)
+    {
+        if (node is null)
+        {
+            return "null";
+        }
+
+        using var buffer = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(buffer))
+        {
+            Write(writer, node);
+        }
+
+        return Encoding.UTF8.GetString(buffer.ToArray());
+    }
+
+    internal static void Write(Utf8JsonWriter writer, JsonNode? node)
+    {
+        switch (node)
+        {
+            case null:
+                writer.WriteNullValue();
+                return;
+            case JsonObject obj:
+                writer.WriteStartObject();
+                foreach (KeyValuePair<string, JsonNode?> property in obj)
+                {
+                    writer.WritePropertyName(property.Key);
+                    Write(writer, property.Value);
+                }
+
+                writer.WriteEndObject();
+                return;
+            case JsonArray array:
+                writer.WriteStartArray();
+                foreach (JsonNode? element in array)
+                {
+                    Write(writer, element);
+                }
+
+                writer.WriteEndArray();
+                return;
+            case JsonValue value:
+                WritePrimitive(writer, value);
+                return;
+            default:
+                writer.WriteNullValue();
+                return;
+        }
+    }
+
+    private static void WritePrimitive(Utf8JsonWriter writer, JsonValue value)
+    {
+        // JsonNode.Parse wraps numbers and strings in a JsonElement holder, so
+        // TryGetValue<T> reports false even for an obvious string. Discriminate on
+        // the value kind first and only then read the typed payload.
+        switch (value.GetValueKind())
+        {
+            case JsonValueKind.String:
+                writer.WriteStringValue(value.GetValue<string>());
+                return;
+            case JsonValueKind.True:
+                writer.WriteBooleanValue(true);
+                return;
+            case JsonValueKind.False:
+                writer.WriteBooleanValue(false);
+                return;
+            case JsonValueKind.Null:
+                writer.WriteNullValue();
+                return;
+            case JsonValueKind.Number:
+                if (value.TryGetValue(out int number))
+                {
+                    writer.WriteNumberValue(number);
+                    return;
+                }
+
+                if (value.TryGetValue(out long longNumber))
+                {
+                    writer.WriteNumberValue(longNumber);
+                    return;
+                }
+
+                if (value.TryGetValue(out double real))
+                {
+                    writer.WriteNumberValue(real);
+                    return;
+                }
+
+                if (value.TryGetValue(out JsonElement element))
+                {
+                    writer.WriteRawValue(element.GetRawText());
+                    return;
+                }
+
+                writer.WriteNullValue();
+                return;
+            default:
+                writer.WriteNullValue();
+                return;
+        }
+    }
 }
 
 /// <summary>
@@ -314,9 +458,7 @@ internal sealed class DidaSyncService
         string signalPath = Path.Combine(Path.GetDirectoryName(todoPath)!, "todo.sync");
         string statePath = Path.Combine(DeskBoxDataPathService.Current.RootPath, "dida-sync-state.json");
 
-        JsonObject state = LoadState(statePath);
-        JsonObject byLocal = state["byLocal"] as JsonObject ?? new JsonObject();
-        state["byLocal"] = byLocal;
+        SyncState state = LoadState(statePath);
 
         IReadOnlyList<string> scope = config.SyncProjectIds;
         if (scope.Count == 0)
@@ -333,16 +475,18 @@ internal sealed class DidaSyncService
         // mapping and the mirror are dropped before the first round against a
         // new account.
         string fingerprint = TokenFingerprint(config.Token);
-        if (state["tokenFingerprint"]?.GetValue<string>() is { Length: > 0 } previousFingerprint &&
-            !string.Equals(previousFingerprint, fingerprint, StringComparison.Ordinal))
+        if (state.TokenFingerprint.Length > 0 &&
+            !string.Equals(state.TokenFingerprint, fingerprint, StringComparison.Ordinal))
         {
-            byLocal.Clear();
+            state.ByLocal.Clear();
             local.Items = new List<TodoItem>();
             await store.SaveAsync(local).ConfigureAwait(false);
             App.Log("[DidaSync] API token changed: cleared local mirror and mapping for the new account.");
         }
 
-        state["tokenFingerprint"] = fingerprint;
+        state.TokenFingerprint = fingerprint;
+        state.ProjectId = primaryProject;
+        state.ProjectIds = scope.ToList();
 
         var planned = new Dictionary<string, TodoItem>(StringComparer.Ordinal);
         foreach (TodoItem item in local.Items)
@@ -362,7 +506,7 @@ internal sealed class DidaSyncService
         {
             foreach (JsonNode? task in await client.GetOpenTasksAsync(projectId, token).ConfigureAwait(false))
             {
-                if (task is JsonObject obj && obj["id"]?.GetValue<string>() is { Length: > 0 } id)
+                if (task is JsonObject obj && ReadString(obj, "id") is { Length: > 0 } id)
                 {
                     remote[id] = obj.DeepClone();
                     remoteProject[id] = projectId;
@@ -375,20 +519,19 @@ internal sealed class DidaSyncService
             .ConfigureAwait(false);
         foreach (JsonNode? task in completed)
         {
-            if (task is JsonObject obj && obj["id"]?.GetValue<string>() is { Length: > 0 } id)
+            if (task is JsonObject obj && ReadString(obj, "id") is { Length: > 0 } id)
             {
                 remote[id] = obj.DeepClone();
-                remoteProject[id] = ResolveScopeProject(obj["projectId"]?.GetValue<string>(), scope, primaryProject);
+                remoteProject[id] = ResolveScopeProject(ReadString(obj, "projectId"), scope, primaryProject);
             }
         }
 
         var remoteOwner = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (KeyValuePair<string, JsonNode?> entry in byLocal)
+        foreach (KeyValuePair<string, SyncMapping> entry in state.ByLocal)
         {
-            if (entry.Value is JsonObject mapping &&
-                mapping["remoteId"]?.GetValue<string>() is { Length: > 0 } remoteId)
+            if (entry.Value.RemoteId.Length > 0)
             {
-                remoteOwner[remoteId] = entry.Key;
+                remoteOwner[entry.Value.RemoteId] = entry.Key;
             }
         }
 
@@ -411,9 +554,8 @@ internal sealed class DidaSyncService
         // ---- local -> remote ----------------------------------------------
         foreach ((string localId, TodoItem item) in planned.ToList())
         {
-            JsonObject? mapping = byLocal[localId] as JsonObject;
-            JsonObject baseline = mapping?["local"] as JsonObject ?? new JsonObject();
-            JsonObject current = NormalizeLocal(item);
+            state.ByLocal.TryGetValue(localId, out SyncMapping? mapping);
+            string current = NormalizeLocal(item);
 
             if (mapping is null)
             {
@@ -433,7 +575,7 @@ internal sealed class DidaSyncService
                         continue;
                     }
 
-                    string candidateTitle = candidate["title"]?.GetValue<string>()?.Trim() ?? string.Empty;
+                    string candidateTitle = ReadString(candidate, "title").Trim();
                     if (!string.Equals(candidateTitle, item.Text?.Trim(), StringComparison.Ordinal))
                     {
                         continue;
@@ -454,34 +596,37 @@ internal sealed class DidaSyncService
                 if (adoptedId is not null && remote[adoptedId] is JsonObject adoptedTask)
                 {
                     unbound.Remove(adoptedId);
-                    byLocal[localId] = new JsonObject
+                    state.ByLocal[localId] = new SyncMapping
                     {
-                        ["remoteId"] = adoptedId,
-                        ["projectId"] = remoteProject.TryGetValue(adoptedId, out string? adoptedProject)
+                        RemoteId = adoptedId,
+                        ProjectId = remoteProject.TryGetValue(adoptedId, out string? adoptedProject)
                             ? adoptedProject
                             : primaryProject,
-                        ["local"] = current.DeepClone(),
-                        ["remote"] = NormalizeRemote(adoptedTask).DeepClone()
+                        LocalJson = current,
+                        LocalCompleted = item.IsCompleted,
+                        RemoteJson = NormalizeRemote(adoptedTask)
                     };
                     remoteOwner[adoptedId] = localId;
                     App.Log($"[DidaSync] Adopted existing remote task: {item.Text}");
                     continue;
                 }
 
-                JsonObject body = LocalToRemoteBody(item, primaryProject, null);
-                JsonObject created = await client.CreateTaskAsync(body, token).ConfigureAwait(false);
-                string? newRemoteId = created["id"]?.GetValue<string>();
-                if (string.IsNullOrWhiteSpace(newRemoteId))
+                JsonObject created = await client
+                    .CreateTaskAsync(LocalToRemoteBody(item, primaryProject, null), token)
+                    .ConfigureAwait(false);
+                string newRemoteId = ReadString(created, "id");
+                if (newRemoteId.Length == 0)
                 {
                     throw new DidaApiException("create returned no task id");
                 }
 
-                byLocal[localId] = new JsonObject
+                state.ByLocal[localId] = new SyncMapping
                 {
-                    ["remoteId"] = newRemoteId,
-                    ["projectId"] = primaryProject,
-                    ["local"] = current.DeepClone(),
-                    ["remote"] = new JsonObject()
+                    RemoteId = newRemoteId,
+                    ProjectId = primaryProject,
+                    LocalJson = current,
+                    LocalCompleted = item.IsCompleted,
+                    RemoteJson = "{}"
                 };
                 remoteOwner[newRemoteId] = localId;
                 pushed.Add(newRemoteId);
@@ -490,13 +635,13 @@ internal sealed class DidaSyncService
                 continue;
             }
 
-            if (current.ToJsonString() == baseline.ToJsonString())
+            if (string.Equals(current, mapping.LocalJson, StringComparison.Ordinal))
             {
                 continue;
             }
 
-            string? taskId = mapping["remoteId"]?.GetValue<string>();
-            string mappingProject = mapping["projectId"]?.GetValue<string>() ?? string.Empty;
+            string taskId = mapping.RemoteId;
+            string mappingProject = mapping.ProjectId;
             if (mappingProject.Length > 0 && !scope.Contains(mappingProject, StringComparer.Ordinal))
             {
                 // The owning project left the sync scope. Leave the local copy
@@ -505,22 +650,24 @@ internal sealed class DidaSyncService
                 continue;
             }
 
-            if (string.IsNullOrWhiteSpace(taskId) || remote[taskId] is not JsonObject remoteTask)
+            if (taskId.Length == 0 || remote[taskId] is not JsonObject remoteTask)
             {
                 // The remote copy is gone (deleted there, or completed long ago).
                 // Re-create it instead of losing the local edit.
                 if (!item.IsDeleted)
                 {
                     string recreateProject = mappingProject.Length > 0 ? mappingProject : primaryProject;
-                    JsonObject body = LocalToRemoteBody(item, recreateProject, null);
-                    JsonObject created = await client.CreateTaskAsync(body, token).ConfigureAwait(false);
-                    string? newRemoteId = created["id"]?.GetValue<string>();
-                    if (!string.IsNullOrWhiteSpace(newRemoteId))
+                    JsonObject created = await client
+                        .CreateTaskAsync(LocalToRemoteBody(item, recreateProject, null), token)
+                        .ConfigureAwait(false);
+                    string newRemoteId = ReadString(created, "id");
+                    if (newRemoteId.Length > 0)
                     {
-                        mapping["remoteId"] = newRemoteId;
-                        mapping["projectId"] = recreateProject;
-                        mapping["local"] = current.DeepClone();
-                        mapping["remote"] = new JsonObject();
+                        mapping.RemoteId = newRemoteId;
+                        mapping.ProjectId = recreateProject;
+                        mapping.LocalJson = current;
+                        mapping.LocalCompleted = item.IsCompleted;
+                        mapping.RemoteJson = "{}";
                         remoteOwner[newRemoteId] = localId;
                         pushed.Add(newRemoteId);
                         changes++;
@@ -533,9 +680,10 @@ internal sealed class DidaSyncService
             // Two-sided edit: newest timestamp wins.
             DateTimeOffset localTime = item.UpdatedAt;
             DateTimeOffset remoteTime = ParseDidaTime(
-                remoteTask["modifiedTime"]?.GetValue<string>() ??
-                remoteTask["completedTime"]?.GetValue<string>()) ?? DateTimeOffset.MinValue;
-            bool remoteChanged = (mapping["remote"] as JsonObject)?.ToJsonString() != NormalizeRemote(remoteTask).ToJsonString();
+                ReadString(remoteTask, "modifiedTime") is { Length: > 0 } modified
+                    ? modified
+                    : ReadString(remoteTask, "completedTime")) ?? DateTimeOffset.MinValue;
+            bool remoteChanged = !string.Equals(mapping.RemoteJson, NormalizeRemote(remoteTask), StringComparison.Ordinal);
             if (remoteChanged && remoteTime > localTime)
             {
                 continue;
@@ -545,9 +693,10 @@ internal sealed class DidaSyncService
                 ? resolvedProject
                 : (mappingProject.Length > 0 ? mappingProject : primaryProject);
 
-            bool wasCompleted = baseline["isCompleted"]?.GetValue<bool>() ?? false;
-            JsonObject updateBody = LocalToRemoteBody(item, taskProject, taskId);
-            await client.UpdateTaskAsync(taskId, updateBody, token).ConfigureAwait(false);
+            bool wasCompleted = mapping.LocalCompleted;
+            await client
+                .UpdateTaskAsync(taskId, LocalToRemoteBody(item, taskProject, taskId), token)
+                .ConfigureAwait(false);
 
             if (item.IsCompleted && !wasCompleted)
             {
@@ -556,17 +705,18 @@ internal sealed class DidaSyncService
             else if (!item.IsCompleted && wasCompleted)
             {
                 // Reopen has no documented endpoint; status:0 is best effort.
-                var reopen = new JsonObject
+                string reopen = DidaJson.Build(writer =>
                 {
-                    ["id"] = taskId,
-                    ["projectId"] = taskProject,
-                    ["status"] = 0
-                };
+                    writer.WriteString("id", taskId);
+                    writer.WriteString("projectId", taskProject);
+                    writer.WriteNumber("status", 0);
+                });
                 await client.UpdateTaskAsync(taskId, reopen, token).ConfigureAwait(false);
             }
 
-            mapping["local"] = current.DeepClone();
-            mapping["projectId"] = taskProject;
+            mapping.LocalJson = current;
+            mapping.LocalCompleted = item.IsCompleted;
+            mapping.ProjectId = taskProject;
             pushed.Add(taskId);
             changes++;
             App.Log($"[DidaSync] Pushed local change: {item.Text}");
@@ -582,7 +732,7 @@ internal sealed class DidaSyncService
             {
                 foreach (JsonNode? task in await client.GetOpenTasksAsync(projectId, token).ConfigureAwait(false))
                 {
-                    if (task is JsonObject obj && obj["id"]?.GetValue<string>() is { Length: > 0 } id)
+                    if (task is JsonObject obj && ReadString(obj, "id") is { Length: > 0 } id)
                     {
                         remote[id] = obj.DeepClone();
                         remoteProject[id] = projectId;
@@ -594,11 +744,11 @@ internal sealed class DidaSyncService
                 .GetCompletedTasksAsync(scope, now.AddDays(-config.CompletedLookbackDays), now.AddDays(1), token)
                 .ConfigureAwait(false))
             {
-                if (task is JsonObject obj && obj["id"]?.GetValue<string>() is { Length: > 0 } id)
+                if (task is JsonObject obj && ReadString(obj, "id") is { Length: > 0 } id)
                 {
                     remote[id] = obj.DeepClone();
                     remoteProject[id] = ResolveScopeProject(
-                        obj["projectId"]?.GetValue<string>(),
+                        ReadString(obj, "projectId"),
                         scope,
                         primaryProject);
                 }
@@ -617,14 +767,15 @@ internal sealed class DidaSyncService
             {
                 TodoItem created = NewLocalItem(task);
                 planned[created.Id] = created;
-                byLocal[created.Id] = new JsonObject
+                state.ByLocal[created.Id] = new SyncMapping
                 {
-                    ["remoteId"] = remoteId,
-                    ["projectId"] = remoteProject.TryGetValue(remoteId, out string? sourceProject)
+                    RemoteId = remoteId,
+                    ProjectId = remoteProject.TryGetValue(remoteId, out string? sourceProject)
                         ? sourceProject
                         : primaryProject,
-                    ["local"] = NormalizeLocal(created).DeepClone(),
-                    ["remote"] = NormalizeRemote(task).DeepClone()
+                    LocalJson = NormalizeLocal(created),
+                    LocalCompleted = created.IsCompleted,
+                    RemoteJson = NormalizeRemote(task)
                 };
                 remoteOwner[remoteId] = created.Id;
                 localDirty = true;
@@ -638,14 +789,13 @@ internal sealed class DidaSyncService
                 continue;
             }
 
-            if (byLocal[ownerId] is not JsonObject mapping)
+            if (!state.ByLocal.TryGetValue(ownerId, out SyncMapping? mapping))
             {
                 continue;
             }
 
-            JsonObject previous = mapping["remote"] as JsonObject ?? new JsonObject();
-            JsonObject normalizedRemote = NormalizeRemote(task);
-            if (previous.ToJsonString() == normalizedRemote.ToJsonString())
+            string normalizedRemote = NormalizeRemote(task);
+            if (string.Equals(mapping.RemoteJson, normalizedRemote, StringComparison.Ordinal))
             {
                 continue;
             }
@@ -655,34 +805,19 @@ internal sealed class DidaSyncService
                 continue;
             }
 
-            JsonObject patch = RemoteToLocalPatch(task, existing);
-            bool stepsSame = StepsEqual(existing, patch);
-            bool fieldsChanged = false;
-            foreach ((string key, JsonNode? value) in patch)
-            {
-                if (key is "steps" or "updatedAt")
-                {
-                    continue;
-                }
-
-                string currentValue = LocalFieldAsString(existing, key);
-                string nextValue = value?.ToJsonString().Trim('"') ?? string.Empty;
-                if (!string.Equals(currentValue, nextValue, StringComparison.Ordinal))
-                {
-                    fieldsChanged = true;
-                    break;
-                }
-            }
-
+            bool stepsSame = StepsEqual(existing, task);
+            bool fieldsChanged = RemoteFieldsChanged(existing, task);
             if (!fieldsChanged && stepsSame)
             {
-                mapping["remote"] = normalizedRemote.DeepClone();
+                mapping.RemoteJson = normalizedRemote;
                 continue;
             }
 
             ApplyRemotePatch(existing, task, stepsSame);
             planned[existing.Id] = existing;
-            mapping["remote"] = normalizedRemote.DeepClone();
+            mapping.RemoteJson = normalizedRemote;
+            mapping.LocalJson = NormalizeLocal(existing);
+            mapping.LocalCompleted = existing.IsCompleted;
             localDirty = true;
             changes++;
             App.Log($"[DidaSync] Applied remote change: {existing.Text}");
@@ -691,20 +826,14 @@ internal sealed class DidaSyncService
         // ---- commit -------------------------------------------------------
         foreach ((string localId, TodoItem item) in planned)
         {
-            if (byLocal[localId] is JsonObject mapping)
+            if (state.ByLocal.TryGetValue(localId, out SyncMapping? mapping))
             {
-                mapping["local"] = NormalizeLocal(item).DeepClone();
+                mapping.LocalJson = NormalizeLocal(item);
+                mapping.LocalCompleted = item.IsCompleted;
             }
         }
 
-        state["projectId"] = primaryProject;
-        var scopeNode = new JsonArray();
-        foreach (string projectId in scope)
-        {
-            scopeNode.Add(projectId);
-        }
-
-        state["projectIds"] = scopeNode;
+        state.LastStatusAt = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
 
         if (localDirty)
         {
@@ -718,8 +847,7 @@ internal sealed class DidaSyncService
             LastStatus = $"已是最新 · {DateTime.Now:HH:mm:ss}";
         }
 
-        state["lastStatus"] = LastStatus;
-        state["lastStatusAt"] = DateTimeOffset.UtcNow.ToString("O", CultureInfo.InvariantCulture);
+        state.LastStatus = LastStatus;
         SaveState(statePath, state);
         return changes;
     }
@@ -775,17 +903,90 @@ internal sealed class DidaSyncService
         return Convert.ToHexString(hash)[..16];
     }
 
-    private static JsonObject LoadState(string path)
+    private sealed class SyncMapping
     {
+        internal string RemoteId { get; set; } = string.Empty;
+
+        internal string ProjectId { get; set; } = string.Empty;
+
+        /// <summary>Canonical local snapshot as JSON text (see NormalizeLocal).</summary>
+        internal string LocalJson { get; set; } = string.Empty;
+
+        /// <summary>Canonical remote snapshot as JSON text (see NormalizeRemote).</summary>
+        internal string RemoteJson { get; set; } = string.Empty;
+
+        internal bool LocalCompleted { get; set; }
+    }
+
+    private sealed class SyncState
+    {
+        internal string ProjectId { get; set; } = string.Empty;
+
+        internal List<string> ProjectIds { get; set; } = new();
+
+        internal string TokenFingerprint { get; set; } = string.Empty;
+
+        internal string LastStatus { get; set; } = string.Empty;
+
+        internal string LastStatusAt { get; set; } = string.Empty;
+
+        internal Dictionary<string, SyncMapping> ByLocal { get; } = new(StringComparer.Ordinal);
+    }
+
+    private static SyncState LoadState(string path)
+    {
+        var state = new SyncState();
         try
         {
-            if (File.Exists(path))
+            if (!File.Exists(path))
             {
-                if (JsonNode.Parse(File.ReadAllText(path)) is JsonObject root)
+                return state;
+            }
+
+            if (JsonNode.Parse(File.ReadAllText(path)) is not JsonObject root)
+            {
+                return state;
+            }
+
+            // Keep the local mapping across project-scope edits: dropping it
+            // would re-push every local item as a brand-new task.
+            state.ProjectId = ReadString(root, "projectId");
+            state.TokenFingerprint = ReadString(root, "tokenFingerprint");
+            state.LastStatus = ReadString(root, "lastStatus");
+            state.LastStatusAt = ReadString(root, "lastStatusAt");
+
+            if (root["projectIds"] is JsonArray ids)
+            {
+                foreach (JsonNode? id in ids)
                 {
-                    // Keep the local mapping across project-scope edits: dropping
-                    // it would re-push every local item as a brand-new task.
-                    return root;
+                    if (id is JsonValue value && value.TryGetValue(out string? text) && !string.IsNullOrWhiteSpace(text))
+                    {
+                        state.ProjectIds.Add(text);
+                    }
+                }
+            }
+
+            if (root["byLocal"] is JsonObject map)
+            {
+                foreach (KeyValuePair<string, JsonNode?> entry in map)
+                {
+                    if (entry.Value is not JsonObject mapping)
+                    {
+                        continue;
+                    }
+
+                    // Older builds stored the snapshots as JSON objects; newer
+                    // ones store canonical text. Both end up as text here.
+                    state.ByLocal[entry.Key] = new SyncMapping
+                    {
+                        RemoteId = ReadString(mapping, "remoteId"),
+                        ProjectId = ReadString(mapping, "projectId"),
+                        LocalJson = SnapshotText(mapping["local"]),
+                        RemoteJson = SnapshotText(mapping["remote"]),
+                        LocalCompleted = mapping["localCompleted"] is JsonNode completed
+                            ? ReadBool(completed)
+                            : SnapshotCompleted(mapping["local"])
+                    };
                 }
             }
         }
@@ -794,14 +995,53 @@ internal sealed class DidaSyncService
             App.Log($"[DidaSync] Ignoring unreadable state: {ex.Message}");
         }
 
-        return new JsonObject
-        {
-            ["version"] = 2,
-            ["byLocal"] = new JsonObject()
-        };
+        return state;
     }
 
-    private static void SaveState(string path, JsonObject state)
+    private static string SnapshotText(JsonNode? node)
+    {
+        if (node is null)
+        {
+            return string.Empty;
+        }
+
+        if (node is JsonValue value)
+        {
+            if (value.TryGetValue<string>(out string? text) && text is not null)
+            {
+                return text;
+            }
+
+            if (value.GetValueKind() == JsonValueKind.String)
+            {
+                return value.GetValue<string>() ?? string.Empty;
+            }
+        }
+
+        return DidaJson.Text(node);
+    }
+
+    private static bool SnapshotCompleted(JsonNode? node) =>
+        node is JsonObject snapshot && snapshot["isCompleted"] is JsonNode flag && ReadBool(flag);
+
+    private static bool ReadBool(JsonNode node)
+    {
+        try
+        {
+            if (node is JsonValue value && value.TryGetValue(out bool flag))
+            {
+                return flag;
+            }
+
+            return node.GetValueKind() == JsonValueKind.True;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void SaveState(string path, SyncState state)
     {
         try
         {
@@ -811,8 +1051,40 @@ internal sealed class DidaSyncService
                 Directory.CreateDirectory(directory);
             }
 
+            using var buffer = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions { Indented = true }))
+            {
+                writer.WriteStartObject();
+                writer.WriteNumber("version", 3);
+                writer.WriteString("projectId", state.ProjectId);
+                writer.WriteStartArray("projectIds");
+                foreach (string projectId in state.ProjectIds)
+                {
+                    writer.WriteStringValue(projectId);
+                }
+
+                writer.WriteEndArray();
+                writer.WriteString("tokenFingerprint", state.TokenFingerprint);
+                writer.WriteString("lastStatus", state.LastStatus);
+                writer.WriteString("lastStatusAt", state.LastStatusAt);
+                writer.WriteStartObject("byLocal");
+                foreach (KeyValuePair<string, SyncMapping> entry in state.ByLocal)
+                {
+                    writer.WriteStartObject(entry.Key);
+                    writer.WriteString("remoteId", entry.Value.RemoteId);
+                    writer.WriteString("projectId", entry.Value.ProjectId);
+                    writer.WriteString("local", entry.Value.LocalJson);
+                    writer.WriteString("remote", entry.Value.RemoteJson);
+                    writer.WriteBoolean("localCompleted", entry.Value.LocalCompleted);
+                    writer.WriteEndObject();
+                }
+
+                writer.WriteEndObject();
+                writer.WriteEndObject();
+            }
+
             string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-            File.WriteAllText(temp, state.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+            File.WriteAllText(temp, Encoding.UTF8.GetString(buffer.ToArray()));
             File.Move(temp, path, overwrite: true);
         }
         catch (Exception ex)
@@ -823,93 +1095,94 @@ internal sealed class DidaSyncService
 
     // ---- field mapping ----------------------------------------------------
 
-    private static JsonObject NormalizeLocal(TodoItem item)
+    private static string NormalizeLocal(TodoItem item)
     {
-        var steps = new JsonArray();
-        foreach (TodoStep step in item.Steps ?? new List<TodoStep>())
+        return DidaJson.Build(writer =>
         {
-            steps.Add(new JsonArray(step.Text ?? string.Empty, step.IsCompleted));
-        }
+            writer.WriteString("text", item.Text ?? string.Empty);
+            writer.WriteBoolean("isCompleted", item.IsCompleted);
+            writer.WriteBoolean("isImportant", item.IsImportant);
+            writer.WriteString("dueDate", CanonicalDate(item.DueDate) ?? string.Empty);
+            writer.WriteString("notes", item.Notes ?? string.Empty);
+            writer.WriteStartArray("steps");
+            foreach (TodoStep step in item.Steps ?? new List<TodoStep>())
+            {
+                writer.WriteStartArray();
+                writer.WriteStringValue(step.Text ?? string.Empty);
+                writer.WriteBooleanValue(step.IsCompleted);
+                writer.WriteEndArray();
+            }
 
-        return new JsonObject
-        {
-            ["text"] = item.Text ?? string.Empty,
-            ["isCompleted"] = item.IsCompleted,
-            ["isImportant"] = item.IsImportant,
-            ["dueDate"] = CanonicalDate(item.DueDate),
-            ["notes"] = item.Notes ?? string.Empty,
-            ["steps"] = steps,
-            ["isDeleted"] = item.IsDeleted
-        };
+            writer.WriteEndArray();
+            writer.WriteBoolean("isDeleted", item.IsDeleted);
+        });
     }
 
-    private static JsonObject NormalizeRemote(JsonObject task)
+    private static string NormalizeRemote(JsonObject task)
     {
-        var items = new JsonArray();
-        if (task["items"] is JsonArray source)
+        return DidaJson.Build(writer =>
         {
-            foreach (JsonNode? sub in source)
+            writer.WriteString("title", ReadString(task, "title"));
+            writer.WriteNumber("status", ReadInt(task, "status"));
+            writer.WriteNumber("priority", ReadInt(task, "priority"));
+            writer.WriteString("dueDate", CanonicalDate(ParseDidaTime(ReadString(task, "dueDate"))) ?? string.Empty);
+            writer.WriteString("content", ReadString(task, "content"));
+            writer.WriteStartArray("items");
+            if (task["items"] is JsonArray source)
             {
-                if (sub is JsonObject obj)
+                foreach (JsonNode? sub in source)
                 {
-                    items.Add(new JsonArray(
-                        obj["title"]?.GetValue<string>() ?? string.Empty,
-                        ReadInt(obj, "status") == 1));
+                    if (sub is JsonObject obj)
+                    {
+                        writer.WriteStartArray();
+                        writer.WriteStringValue(ReadString(obj, "title"));
+                        writer.WriteBooleanValue(ReadInt(obj, "status") == 1);
+                        writer.WriteEndArray();
+                    }
                 }
             }
-        }
 
-        return new JsonObject
-        {
-            ["title"] = task["title"]?.GetValue<string>() ?? string.Empty,
-            ["status"] = ReadInt(task, "status"),
-            ["priority"] = ReadInt(task, "priority"),
-            ["dueDate"] = CanonicalDate(ParseDidaTime(task["dueDate"]?.GetValue<string>())),
-            ["content"] = task["content"]?.GetValue<string>() ?? string.Empty,
-            ["items"] = items
-        };
+            writer.WriteEndArray();
+        });
     }
 
-    private static JsonObject LocalToRemoteBody(TodoItem item, string projectId, string? taskId)
+    private static string LocalToRemoteBody(TodoItem item, string projectId, string? taskId)
     {
-        var body = new JsonObject
+        return DidaJson.Build(writer =>
         {
-            ["projectId"] = projectId,
-            ["title"] = string.IsNullOrWhiteSpace(item.Text) ? "(untitled)" : item.Text,
-            ["content"] = item.Notes ?? string.Empty,
-            ["priority"] = item.IsImportant ? 5 : 0,
-            ["timeZone"] = "Asia/Shanghai"
-        };
+            writer.WriteString("projectId", projectId);
+            writer.WriteString("title", string.IsNullOrWhiteSpace(item.Text) ? "(untitled)" : item.Text);
+            writer.WriteString("content", item.Notes ?? string.Empty);
+            writer.WriteNumber("priority", item.IsImportant ? 5 : 0);
+            writer.WriteString("timeZone", "Asia/Shanghai");
 
-        if (!string.IsNullOrWhiteSpace(taskId))
-        {
-            body["id"] = taskId;
-        }
-
-        if (item.DueDate is { } due)
-        {
-            body["dueDate"] = DidaApiClient.FormatDida(due);
-            body["isAllDay"] = false;
-        }
-
-        if (item.Steps is { Count: > 0 } steps)
-        {
-            body["kind"] = "CHECKLIST";
-            var items = new JsonArray();
-            for (int index = 0; index < steps.Count; index++)
+            if (!string.IsNullOrWhiteSpace(taskId))
             {
-                items.Add(new JsonObject
-                {
-                    ["title"] = steps[index].Text ?? string.Empty,
-                    ["status"] = steps[index].IsCompleted ? 1 : 0,
-                    ["sortOrder"] = index
-                });
+                writer.WriteString("id", taskId);
             }
 
-            body["items"] = items;
-        }
+            if (item.DueDate is { } due)
+            {
+                writer.WriteString("dueDate", DidaApiClient.FormatDida(due));
+                writer.WriteBoolean("isAllDay", false);
+            }
 
-        return body;
+            if (item.Steps is { Count: > 0 } steps)
+            {
+                writer.WriteString("kind", "CHECKLIST");
+                writer.WriteStartArray("items");
+                for (int index = 0; index < steps.Count; index++)
+                {
+                    writer.WriteStartObject();
+                    writer.WriteString("title", steps[index].Text ?? string.Empty);
+                    writer.WriteNumber("status", steps[index].IsCompleted ? 1 : 0);
+                    writer.WriteNumber("sortOrder", index);
+                    writer.WriteEndObject();
+                }
+
+                writer.WriteEndArray();
+            }
+        });
     }
 
     private static TodoItem NewLocalItem(JsonObject task)
@@ -917,12 +1190,12 @@ internal sealed class DidaSyncService
         var item = new TodoItem
         {
             Id = Guid.NewGuid().ToString("N"),
-            Text = task["title"]?.GetValue<string>() ?? "(untitled)",
+            Text = ReadString(task, "title") is { Length: > 0 } title ? title : "(untitled)",
             IsCompleted = ReadInt(task, "status") == 2,
             IsImportant = ReadInt(task, "priority") >= 5,
-            DueDate = ParseDidaTime(task["dueDate"]?.GetValue<string>()),
-            Notes = task["content"]?.GetValue<string>(),
-            CompletedAt = ParseDidaTime(task["completedTime"]?.GetValue<string>()),
+            DueDate = ParseDidaTime(ReadString(task, "dueDate")),
+            Notes = ReadString(task, "content") is { Length: > 0 } notes ? notes : null,
+            CompletedAt = ParseDidaTime(ReadString(task, "completedTime")),
             SortOrder = 0,
             DeviceId = "dida-sync",
             UpdatedAt = DateTimeOffset.UtcNow,
@@ -939,7 +1212,7 @@ internal sealed class DidaSyncService
                     item.Steps.Add(new TodoStep
                     {
                         Id = Guid.NewGuid().ToString("N"),
-                        Text = obj["title"]?.GetValue<string>() ?? string.Empty,
+                        Text = ReadString(obj, "title"),
                         IsCompleted = ReadInt(obj, "status") == 1,
                         SortOrder = index++
                     });
@@ -950,59 +1223,38 @@ internal sealed class DidaSyncService
         return item;
     }
 
-    private static JsonObject RemoteToLocalPatch(JsonObject task, TodoItem existing)
+    private static bool StepsEqual(TodoItem existing, JsonObject task)
     {
-        var steps = new JsonArray();
-        if (task["items"] is JsonArray subs)
-        {
-            foreach (JsonNode? sub in subs)
-            {
-                if (sub is JsonObject obj)
-                {
-                    steps.Add(new JsonObject
-                    {
-                        ["text"] = obj["title"]?.GetValue<string>() ?? string.Empty,
-                        ["isCompleted"] = ReadInt(obj, "status") == 1
-                    });
-                }
-            }
-        }
-
-        return new JsonObject
-        {
-            ["text"] = task["title"]?.GetValue<string>() ?? "(untitled)",
-            ["isCompleted"] = ReadInt(task, "status") == 2,
-            ["isImportant"] = ReadInt(task, "priority") >= 5,
-            ["dueDate"] = CanonicalDate(ParseDidaTime(task["dueDate"]?.GetValue<string>())),
-            ["notes"] = task["content"]?.GetValue<string>() ?? string.Empty,
-            ["steps"] = steps
-        };
-    }
-
-    private static bool StepsEqual(TodoItem existing, JsonObject patch)
-    {
-        if (patch["steps"] is not JsonArray incoming)
+        if (task["items"] is not JsonArray incoming)
         {
             return (existing.Steps?.Count ?? 0) == 0;
         }
 
-        if ((existing.Steps?.Count ?? 0) != incoming.Count)
+        int expected = 0;
+        foreach (JsonNode? sub in incoming)
+        {
+            if (sub is JsonObject)
+            {
+                expected++;
+            }
+        }
+
+        if ((existing.Steps?.Count ?? 0) != expected)
         {
             return false;
         }
 
-        for (int index = 0; index < incoming.Count; index++)
+        int index = 0;
+        foreach (JsonNode? sub in incoming)
         {
-            if (incoming[index] is not JsonObject row)
+            if (sub is not JsonObject row)
             {
-                return false;
+                continue;
             }
 
-            TodoStep step = existing.Steps![index];
-            string text = row["text"]?.GetValue<string>() ?? string.Empty;
-            bool completed = row["isCompleted"]?.GetValue<bool>() ?? false;
-            if (!string.Equals(step.Text ?? string.Empty, text, StringComparison.Ordinal) ||
-                step.IsCompleted != completed)
+            TodoStep step = existing.Steps![index++];
+            if (!string.Equals(step.Text ?? string.Empty, ReadString(row, "title"), StringComparison.Ordinal) ||
+                step.IsCompleted != (ReadInt(row, "status") == 1))
             {
                 return false;
             }
@@ -1011,14 +1263,26 @@ internal sealed class DidaSyncService
         return true;
     }
 
+    private static bool RemoteFieldsChanged(TodoItem existing, JsonObject task)
+    {
+        string title = ReadString(task, "title");
+        return
+            !string.Equals(existing.Text ?? string.Empty, title.Length > 0 ? title : "(untitled)", StringComparison.Ordinal) ||
+            existing.IsCompleted != (ReadInt(task, "status") == 2) ||
+            existing.IsImportant != (ReadInt(task, "priority") >= 5) ||
+            existing.DueDate != ParseDidaTime(ReadString(task, "dueDate")) ||
+            !string.Equals(existing.Notes ?? string.Empty, ReadString(task, "content"), StringComparison.Ordinal);
+    }
+
     private static void ApplyRemotePatch(TodoItem existing, JsonObject task, bool stepsSame)
     {
-        existing.Text = task["title"]?.GetValue<string>() ?? "(untitled)";
+        string title = ReadString(task, "title");
+        existing.Text = title.Length > 0 ? title : "(untitled)";
         existing.IsCompleted = ReadInt(task, "status") == 2;
         existing.IsImportant = ReadInt(task, "priority") >= 5;
-        existing.DueDate = ParseDidaTime(task["dueDate"]?.GetValue<string>());
-        existing.Notes = task["content"]?.GetValue<string>();
-        existing.CompletedAt = ParseDidaTime(task["completedTime"]?.GetValue<string>());
+        existing.DueDate = ParseDidaTime(ReadString(task, "dueDate"));
+        existing.Notes = ReadString(task, "content") is { Length: > 0 } notes ? notes : null;
+        existing.CompletedAt = ParseDidaTime(ReadString(task, "completedTime"));
         existing.UpdatedAt = DateTimeOffset.UtcNow;
 
         if (stepsSame)
@@ -1038,7 +1302,7 @@ internal sealed class DidaSyncService
                     existing.Steps.Add(new TodoStep
                     {
                         Id = Guid.NewGuid().ToString("N"),
-                        Text = obj["title"]?.GetValue<string>() ?? string.Empty,
+                        Text = ReadString(obj, "title"),
                         IsCompleted = ReadInt(obj, "status") == 1,
                         SortOrder = index++
                     });
@@ -1047,15 +1311,28 @@ internal sealed class DidaSyncService
         }
     }
 
-    private static string LocalFieldAsString(TodoItem item, string key) => key switch
+    private static string ReadString(JsonObject obj, string name)
     {
-        "text" => item.Text ?? string.Empty,
-        "isCompleted" => item.IsCompleted ? "true" : "false",
-        "isImportant" => item.IsImportant ? "true" : "false",
-        "dueDate" => CanonicalDate(item.DueDate) ?? string.Empty,
-        "notes" => item.Notes ?? string.Empty,
-        _ => string.Empty
-    };
+        try
+        {
+            JsonNode? node = obj[name];
+            if (node is null)
+            {
+                return string.Empty;
+            }
+
+            if (node is JsonValue value && value.TryGetValue<string>(out string? text))
+            {
+                return text ?? string.Empty;
+            }
+
+            return node.GetValueKind() == JsonValueKind.String ? node.GetValue<string>() ?? string.Empty : string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
 
     private static int ReadInt(JsonObject obj, string name)
     {
@@ -1069,9 +1346,9 @@ internal sealed class DidaSyncService
 
             return node.GetValueKind() switch
             {
-                System.Text.Json.JsonValueKind.Number => node.GetValue<int>(),
-                System.Text.Json.JsonValueKind.True => 1,
-                System.Text.Json.JsonValueKind.False => 0,
+                JsonValueKind.Number => node.GetValue<int>(),
+                JsonValueKind.True => 1,
+                JsonValueKind.False => 0,
                 _ => 0
             };
         }

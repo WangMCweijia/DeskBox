@@ -1,3 +1,5 @@
+using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace DeskBox.Services;
@@ -39,8 +41,15 @@ internal static class TodoUiOptions
     {
         try
         {
-            JsonObject root = ReadRoot();
-            root[ShowColorFilterKey] = value;
+            // Same AOT trap as dida-sync.json: JsonObject["k"] = bool and
+            // ToJsonString() both need reflection metadata. Stream it instead.
+            using var buffer = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions { Indented = true }))
+            {
+                writer.WriteStartObject();
+                writer.WriteBoolean(ShowColorFilterKey, value);
+                writer.WriteEndObject();
+            }
 
             string path = FilePath;
             string? directory = Path.GetDirectoryName(path);
@@ -50,7 +59,7 @@ internal static class TodoUiOptions
             }
 
             string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-            File.WriteAllText(temp, root.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+            File.WriteAllText(temp, Encoding.UTF8.GetString(buffer.ToArray()));
             File.Move(temp, path, overwrite: true);
 
             lock (Gate)
