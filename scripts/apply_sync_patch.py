@@ -92,10 +92,24 @@ ABOUT_SITE_BUTTON_RE = re.compile(
 )
 
 APP_CS = pathlib.Path("src/DeskBox/App.xaml.cs")
+FILE_SERVICE = pathlib.Path("src/DeskBox/Services/FileService.cs")
 
 CSPROJ = pathlib.Path("src/DeskBox/DeskBox.csproj")
-OLD_VERSION = "1.5.9"
-NEW_VERSION = "1.5.11"
+OLD_VERSION = "1.5.11"
+NEW_VERSION = "1.5.12"
+
+# Raw CreateFileW has no MAX_PATH escape hatch. Managed APIs resolve long
+# paths themselves, so a 264-character file was readable by Directory,
+# File.GetAttributes and FileStream, but FileService.TryCaptureSourceIdentity
+# returned null for it and storage migration aborted with "the source is busy
+# or unavailable". Both call sites belong to the identity path (capture and
+# verified delete), so they are the only two that need the "\\?\ " prefix.
+CREATE_FILE_CALL = "FileTransferNativeMethods.CreateFileW(\n                path,"
+CREATE_FILE_CALL_PATCHED = (
+    "FileTransferNativeMethods.CreateFileW(\n"
+    "                NativeLongPath.Extended(path),"
+)
+MARKER_LONG_PATH = "NativeLongPath.Extended(path)"
 
 # Logon autostart must stay window-less: the startup drain near
 # CompleteExternalActivationInitializationAsync calls the activation handler
@@ -565,6 +579,51 @@ def patch_autostart_no_settings(check: bool) -> int:
     return 0
 
 
+def patch_long_paths(check: bool) -> int:
+    """Let the file-identity path reach files deeper than MAX_PATH.
+
+    Every long path in a real user library breaks storage migration: the scan
+    opens each entry through FileTransferNativeMethods.CreateFileW, which is a
+    plain P/Invoke and therefore bound by the legacy 260-character limit. The
+    call then fails with ERROR_PATH_NOT_FOUND even though the file is free, and
+    TryCaptureSourceIdentity reports it as busy, aborting the copy before a
+    single byte moves. NativeLongPath.Extended (fork-owned file) adds the
+    "\\\\?\\" prefix; this step routes both identity call sites through it.
+    """
+    if not FILE_SERVICE.is_file():
+        print(f"MISSING: {FILE_SERVICE}", file=sys.stderr)
+        return 2
+
+    text, has_bom, newline = read_text(FILE_SERVICE)
+    remaining = text.count(CREATE_FILE_CALL)
+    if remaining == 0 and MARKER_LONG_PATH in text:
+        print("OK: file identity opens long paths.")
+        return 0
+
+    if not pathlib.Path("src/DeskBox/Platform/NativeLongPath.cs").is_file():
+        print("ERROR: src/DeskBox/Platform/NativeLongPath.cs is missing from the fork.", file=sys.stderr)
+        return 3
+
+    # Both identity sites (capture + verified delete) must be rewritten; a
+    # partial patch would leave deletion unable to reach the same files.
+    if remaining != 2:
+        print(
+            "ERROR: expected two CreateFileW identity call sites, found "
+            f"{remaining}; patch by hand.",
+            file=sys.stderr,
+        )
+        return 3
+
+    if check:
+        print("MISSING: file identity opens are not long-path aware.", file=sys.stderr)
+        return 1
+
+    text = text.replace(CREATE_FILE_CALL, CREATE_FILE_CALL_PATCHED)
+    write_text(FILE_SERVICE, text, has_bom, newline)
+    print("patched: file identity opens use the extended path prefix")
+    return 0
+
+
 def patch_version(check: bool) -> int:
     """Stamp this fork's own version so builds never overwrite an old asset.
 
@@ -628,6 +687,7 @@ def main() -> int:
         strip_about_buttons,
         patch_todo_ui,
         patch_autostart_no_settings,
+        patch_long_paths,
         patch_version,
         patch_test_budget,
     ):
