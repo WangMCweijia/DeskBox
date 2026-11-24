@@ -95,8 +95,8 @@ APP_CS = pathlib.Path("src/DeskBox/App.xaml.cs")
 FILE_SERVICE = pathlib.Path("src/DeskBox/Services/FileService.cs")
 
 CSPROJ = pathlib.Path("src/DeskBox/DeskBox.csproj")
-OLD_VERSION = "1.5.11"
-NEW_VERSION = "1.5.12"
+OLD_VERSION = "1.5.12"
+NEW_VERSION = "1.5.13"
 
 # Raw CreateFileW has no MAX_PATH escape hatch. Managed APIs resolve long
 # paths themselves, so a 264-character file was readable by Directory,
@@ -110,6 +110,93 @@ CREATE_FILE_CALL_PATCHED = (
     "                NativeLongPath.Extended(path),"
 )
 MARKER_LONG_PATH = "NativeLongPath.Extended(path)"
+
+# --- Pin to top -----------------------------------------------------------
+# A pin is a local view preference, so it lands on the model as a plain flag
+# (the source-generated store context picks up new properties on its own),
+# sorts ahead of SortOrder, and disappears from the sync projection because
+# ApplyRemotePatch only copies fields Dida365 actually owns.
+TODO_ITEM_MODEL = pathlib.Path("src/DeskBox/Models/TodoItem.cs")
+FILTERING_VM = pathlib.Path("src/DeskBox/ViewModels/TodoWidgetViewModel.FilteringAndAppearance.cs")
+TODO_MENUS = pathlib.Path("src/DeskBox/Controls/WidgetContents/TodoWidgetContent.Menus.cs")
+TODO_XAML = pathlib.Path("src/DeskBox/Controls/WidgetContents/TodoWidgetContent.xaml")
+STRINGS_DIR = pathlib.Path("src/DeskBox/Strings")
+
+PIN_MODEL_ANCHOR = "    public bool IsImportant { get; set; }\n"
+PIN_MODEL_ENTRY = (
+    "    public bool IsImportant { get; set; }\n"
+    "\n"
+    "    /// <summary>\n"
+    '    /// Local-only "pinned above the manual order" flag. Dida365 has no\n'
+    "    /// equivalent field, so the sync engine neither reads nor writes it.\n"
+    "    /// </summary>\n"
+    "    public bool IsPinned { get; set; }\n"
+)
+
+PIN_SORT_ANCHOR = (
+    "        if (left.IsCompleted != right.IsCompleted)\n"
+    "        {\n"
+    "            return left.IsCompleted ? 1 : -1;\n"
+    "        }\n"
+    "\n"
+    "        int sortCompare = left.SortOrder.CompareTo(right.SortOrder);\n"
+)
+PIN_SORT_ENTRY = (
+    "        if (left.IsCompleted != right.IsCompleted)\n"
+    "        {\n"
+    "            return left.IsCompleted ? 1 : -1;\n"
+    "        }\n"
+    "\n"
+    "        // Pinned rows float above the manual order. SortOrder is left\n"
+    "        // untouched, so unpinning returns a row to its previous place.\n"
+    "        if (left.IsPinned != right.IsPinned)\n"
+    "        {\n"
+    "            return left.IsPinned ? -1 : 1;\n"
+    "        }\n"
+    "\n"
+    "        int sortCompare = left.SortOrder.CompareTo(right.SortOrder);\n"
+)
+
+PIN_MENU_ANCHOR = (
+    "        flyout.Items.Add(copyItem);\n"
+    "\n"
+    '        var deleteItem = CreateTodoContextCommand("Common.Delete", "\\uE74D");\n'
+    "        deleteItem.Click += async (_, _) =>\n"
+    "        {\n"
+    "            flyout.Hide();\n"
+    "            await DeleteItemAsync(item);\n"
+    "        };\n"
+)
+PIN_MENU_ENTRY = (
+    "        flyout.Items.Add(copyItem);\n"
+    "        flyout.Items.Add(CreatePinToggleCommand(item));\n"
+    "\n"
+    '        var deleteItem = CreateTodoContextCommand("Common.Delete", "\\uE74D");\n'
+    "        deleteItem.Click += async (_, _) =>\n"
+    "        {\n"
+    "            flyout.Hide();\n"
+    "            await DeleteItemAsync(item);\n"
+    "        };\n"
+)
+
+PIN_XAML_ANCHOR = (
+    '                                        <StackPanel Orientation="Horizontal" Spacing="2" '
+    'Visibility="{Binding AttachmentSummaryVisibility}">\n'
+)
+PIN_XAML_ENTRY = (
+    "                                        <FontIcon\n"
+    '                                            FontSize="{Binding ElementName=TodoListView, Path=DataContext.SmallIconSize}"\n'
+    '                                            Foreground="{ThemeResource TextFillColorTertiaryBrush}"\n'
+    '                                            Glyph="&#xE718;"\n'
+    '                                            Visibility="{Binding PinVisibility}" />\n'
+    + PIN_XAML_ANCHOR
+)
+
+PIN_STRINGS = {
+    "zh-CN.json": (("Todo.Menu.Pin", "置顶"), ("Todo.Menu.Unpin", "取消置顶")),
+    "en-US.json": (("Todo.Menu.Pin", "Pin to top"), ("Todo.Menu.Unpin", "Unpin")),
+}
+PIN_STRINGS_ANCHOR = '"Todo.Menu.MarkImportant"'
 
 # Logon autostart must stay window-less: the startup drain near
 # CompleteExternalActivationInitializationAsync calls the activation handler
@@ -624,6 +711,85 @@ def patch_long_paths(check: bool) -> int:
     return 0
 
 
+def patch_todo_pin(check: bool) -> int:
+    """Wire pin / unpin into the todo widget.
+
+    A pinned row sorts above the manual order and above nothing else: the
+    comparison runs after the completed/active split, so a finished task never
+    jumps over an open one. Everything heavier (flag storage, menu command,
+    row badge) lives in fork-owned partial files; this step only adds the flag
+    to the model, the comparison, the menu call and the row marker.
+    """
+    for required in (
+        "src/DeskBox/ViewModels/TodoItemViewModel.Pin.cs",
+        "src/DeskBox/ViewModels/TodoWidgetViewModel.Pins.cs",
+        "src/DeskBox/Controls/WidgetContents/TodoWidgetContent.Pin.cs",
+    ):
+        if not pathlib.Path(required).is_file():
+            print(f"ERROR: {required} is missing from the fork.", file=sys.stderr)
+            return 3
+
+    edits = (
+        (TODO_ITEM_MODEL, PIN_MODEL_ANCHOR, PIN_MODEL_ENTRY,
+         "public bool IsPinned { get; set; }"),
+        (FILTERING_VM, PIN_SORT_ANCHOR, PIN_SORT_ENTRY,
+         "left.IsPinned != right.IsPinned"),
+        (TODO_MENUS, PIN_MENU_ANCHOR, PIN_MENU_ENTRY,
+         "CreatePinToggleCommand(item)"),
+        (TODO_XAML, PIN_XAML_ANCHOR, PIN_XAML_ENTRY,
+         'Visibility="{Binding PinVisibility}"'),
+    )
+
+    pending: dict[pathlib.Path, tuple[str, bool, str]] = {}
+    for path, old, new, marker in edits:
+        if not path.is_file():
+            print(f"MISSING: {path}", file=sys.stderr)
+            return 2
+
+        text, has_bom, newline = read_text(path)
+        if marker in text:
+            continue
+        if old not in text:
+            print(f"ERROR: pin anchor missing in {path}", file=sys.stderr)
+            return 3
+        pending[path] = (text.replace(old, new, 1), has_bom, newline)
+
+    for name, pairs in PIN_STRINGS.items():
+        path = STRINGS_DIR / name
+        if not path.is_file():
+            print(f"MISSING: {path}", file=sys.stderr)
+            return 2
+
+        text, has_bom, newline = read_text(path)
+        missing = [(key, value) for key, value in pairs if f'"{key}"' not in text]
+        if not missing:
+            continue
+
+        lines = text.split("\n")
+        index = next(
+            (i for i, line in enumerate(lines) if PIN_STRINGS_ANCHOR in line),
+            None,
+        )
+        if index is None:
+            print(f"ERROR: pin string anchor missing in {path}", file=sys.stderr)
+            return 3
+        lines[index + 1:index + 1] = [f'  "{key}": "{value}",' for key, value in missing]
+        pending[path] = ("\n".join(lines), has_bom, newline)
+
+    if not pending:
+        print("OK: todo pin is already wired.")
+        return 0
+
+    if check:
+        print("MISSING: todo pin is not wired.", file=sys.stderr)
+        return 1
+
+    for path, (text, has_bom, newline) in pending.items():
+        write_text(path, text, has_bom, newline)
+        print(f"patched: todo pin in {path}")
+    return 0
+
+
 def patch_version(check: bool) -> int:
     """Stamp this fork's own version so builds never overwrite an old asset.
 
@@ -688,6 +854,7 @@ def main() -> int:
         patch_todo_ui,
         patch_autostart_no_settings,
         patch_long_paths,
+        patch_todo_pin,
         patch_version,
         patch_test_budget,
     ):
